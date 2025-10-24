@@ -24,7 +24,7 @@
     .ok { color: #1b5e20; }
     .warn { color: #b71c1c; }
 
-    /* FEED: новые карточки вставляем сверху через prepend() */
+    /* FEED: новые карточки сверху (prepend) */
     .feed { display:flex; flex-direction: column; gap: 12px; }
     .entry { border:1px solid var(--border); border-radius:14px; padding:12px; background:#fff; }
     .cols { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--col-gap); }
@@ -41,9 +41,7 @@
     .defItem, .synItem { background:#f9fafb; border:1px solid var(--border); border-radius:10px; padding:10px; margin:8px 0; }
     .word { font-weight:700; }
 
-    @media (max-width: 900px) {
-      .cols { grid-template-columns: 1fr; }
-    }
+    @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -55,11 +53,13 @@
       <div class="row">
         <label>Audio source:</label>
         <button id="micBtn">🎙️ Microphone</button>
+        <button id="tabBtn">🖥️ Capture a Chrome Tab (with audio)</button>
         <button id="stopBtn" disabled>⏹️ Stop</button>
       </div>
       <p class="note">
-        *Пока используем один источник — микрофон (лучше наушники учителю, чтобы его голос не попадал в микрофон).
-        Позже подключим серверный Whisper и раздельные каналы.
+        <b>Capture Tab:</b> выбери вкладку и отметь “Share tab audio”. Браузерное распознавание не может напрямую читать этот поток,
+        поэтому мы **воспроизводим звук вкладки через динамики**, а распознаёт микрофон (как в первой версии).
+        Для идеального качества позже подключим серверный Whisper.
       </p>
     </div>
 
@@ -83,31 +83,53 @@
   </div>
 
   <script>
+    // DOM
     const statusEl = document.getElementById('status');
     const out = document.getElementById('transcript');
     const feed = document.getElementById('feed');
     const micBtn = document.getElementById('micBtn');
+    const tabBtn = document.getElementById('tabBtn');
     const stopBtn = document.getElementById('stopBtn');
 
+    // State
     let recog = null;
     let keepListening = false;
     let fullText = "";
     let lastSentTail = "";
     let pingTimer = null;
+    let tabAudioEl = null;   // для захвата вкладки
 
+    // Helpers
     function supportsSR() {
       return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
     }
-    if (!supportsSR()) {
-      alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
-    }
-
     function tail(text, maxWords=25){
       const words = (text||"").trim().split(/\s+/);
       return words.slice(-maxWords).join(" ").toLowerCase();
     }
+    function startUI(mode){
+      micBtn.disabled = true;
+      tabBtn.disabled = true;
+      stopBtn.disabled = false;
+      statusEl.textContent = `listening (${mode})`;
+      statusEl.className = "ok";
+      if (!pingTimer) pingTimer = setInterval(() => { fetch('/api/health').catch(()=>{}); }, 20000);
+    }
+    function stopUI(){
+      stopBtn.disabled = true;
+      micBtn.disabled = false;
+      tabBtn.disabled = false;
+      statusEl.textContent = "stopped";
+      statusEl.className = "";
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    }
 
+    // SpeechRecognition
     function initRecog(lang='en-US') {
+      if (!supportsSR()) {
+        alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
+        return;
+      }
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       recog = new SR();
       recog.lang = lang;
@@ -121,11 +143,9 @@
           if (r.isFinal) {
             const piece = r[0].transcript.trim();
             if (!piece) continue;
-
             fullText += (fullText ? ' ' : '') + piece;
             out.textContent = fullText;
 
-            // отправляем только если хвост изменился (анти-дубль)
             const t = tail(fullText, 25);
             if (t && t !== lastSentTail) {
               lastSentTail = t;
@@ -133,4 +153,162 @@
                 const resp = await fetch('/api/hints', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body:
+                  body: JSON.stringify({ text: fullText })
+                });
+                const data = await resp.json();
+                if (data && data.card) prependCard(data.card);
+              } catch (e) { console.warn('Hints error', e); }
+            }
+          } else {
+            interim += r[0].transcript;
+          }
+        }
+        if (interim) out.textContent = (fullText + ' ' + interim).trim();
+      };
+
+      recog.onerror = (e) => {
+        console.warn('SpeechRecognition error', e);
+        statusEl.textContent = "error (speech)";
+        statusEl.className = "warn";
+      };
+
+      recog.onend = () => {
+        if (keepListening) {
+          try { recog.start(); } catch {}
+        } else {
+          stopUI();
+        }
+      };
+    }
+
+    // UI actions
+    async function startMic(){
+      if (!recog) initRecog('en-US');
+      fullText = ""; lastSentTail = "";
+      out.textContent = "Listening via Microphone…";
+      keepListening = true;
+      startUI('mic');
+      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
+      try { recog.start(); } catch {}
+    }
+
+    async function startTabCapture(){
+      if (!recog) initRecog('en-US');
+      fullText = ""; lastSentTail = "";
+      out.textContent = "Listening to captured tab… (make sure system volume is audible)";
+      keepListening = true;
+      startUI('tab');
+
+      // Захватываем вкладку с аудио и проигрываем её через динамики,
+      // чтобы микрофон “слышал” звук вкладки (ограничение Web Speech API).
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        // создаём аудио-элемент для вывода звука
+        if (tabAudioEl) { try { tabAudioEl.pause(); } catch{} }
+        tabAudioEl = new Audio();
+        tabAudioEl.srcObject = stream;
+        tabAudioEl.muted = false;   // ВКЛЮЧАЕМ звук захваченной вкладки наружу
+        tabAudioEl.play().catch(()=>{});
+      } catch (e) {
+        alert('Tab capture was cancelled. You can use Microphone option instead.');
+        stopAll();
+        return;
+      }
+
+      try { recog.start(); } catch {}
+    }
+
+    function stopAll(){
+      keepListening = false;
+      try { recog && recog.stop(); } catch {}
+      if (tabAudioEl) { try { tabAudioEl.pause(); } catch{} tabAudioEl = null; }
+      stopUI();
+    }
+
+    function prependCard(card){
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      entry.innerHTML = `
+        <div class="cols">
+          <div class="col error">
+            <h4>Errors & Fix</h4>
+            <div class="list errors"></div>
+          </div>
+          <div class="col def">
+            <h4>Definitions</h4>
+            <div class="list defs"></div>
+          </div>
+          <div class="col syn">
+            <h4>Synonyms</h4>
+            <div class="list syns"></div>
+          </div>
+        </div>
+      `;
+
+      const errsWrap = entry.querySelector('.errors');
+      (card.errors || []).forEach(e => {
+        const div = document.createElement('div');
+        div.className = 'errItem';
+        div.innerHTML = `
+          <div class="errTitle">${e.title || 'Mistake'}</div>
+          ${e.wrong ? `<div class="wrong">❌ ${e.wrong}</div>` : ''}
+          ${e.fix ? `<div class="fix">✅ ${e.fix}</div>` : ''}
+          ${e.explanation ? `<div class="ex">${e.explanation}</div>` : ''}
+        `;
+        errsWrap.appendChild(div);
+      });
+
+      const defsWrap = entry.querySelector('.defs');
+      (card.definitions || []).forEach(d => {
+        const div = document.createElement('div');
+        div.className = 'defItem';
+        div.innerHTML = `<div class="word">${d.word || ''} (${d.pos || ''})</div>
+                         <div>${d.simple_def || ''}</div>`;
+        defsWrap.appendChild(div);
+      });
+
+      const synsWrap = entry.querySelector('.syns');
+      (card.synonyms || []).forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'synItem';
+        const list = (s.list || []).join(', ');
+        div.innerHTML = `<div class="word">${s.word || ''} (${s.pos || ''})</div>
+                         <div>${list}</div>`;
+        synsWrap.appendChild(div);
+      });
+
+      feed.prepend(entry);
+      const max = 20;
+      while (feed.children.length > max) feed.removeChild(feed.lastChild);
+    }
+
+    // Bind
+    document.addEventListener('DOMContentLoaded', () => {
+      micBtn.disabled = false;
+      tabBtn.disabled = false;
+      micBtn.onclick = startMic;
+      tabBtn.onclick = startTabCapture;
+      stopBtn.onclick = stopAll;
+
+      // Quick test (manual)
+      const manualBtn = document.getElementById('sendManual');
+      manualBtn.onclick = async () => {
+        const t = document.getElementById('manualText').value.trim();
+        if (!t) return;
+        fullText = fullText ? (fullText + ' ' + t) : t;
+        out.textContent = fullText;
+        lastSentTail = tail(fullText, 25);
+        try {
+          const resp = await fetch('/api/hints', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ text: fullText })
+          });
+          const data = await resp.json();
+          if (data && data.card) prependCard(data.card);
+        } catch(e){ console.warn(e); }
+      };
+    });
+  </script>
+</body>
+</html>
