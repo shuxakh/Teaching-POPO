@@ -1,199 +1,88 @@
-<script>
-  const statusEl = document.getElementById('status');
-  const out = document.getElementById('transcript');
-  const feed = document.getElementById('feed');
-  const micBtn = document.getElementById('micBtn');
-  const tabBtn = document.getElementById('tabBtn');
-  const stopBtn = document.getElementById('stopBtn');
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { OpenAI } from 'openai';
 
-  let recog = null;
-  let keepListening = false;      // <-- флаг “держать прослушку”
-  let fullText = "";
-  let lastSentTail = "";          // <-- последний отправленный “хвост” (для дедупа)
-  let pingTimer = null;           // <-- пинг, чтобы Render не засыпал
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
 
-  function supportsSR() {
-    return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const PORT = process.env.PORT || 8080;
+
+function lastTail(text, maxWords = 25) {
+  const words = (text || '').trim().split(/\s+/);
+  return words.slice(-maxWords).join(' ');
+}
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.post('/api/hints', async (req, res) => {
+  try {
+    const full = (req.body?.text || '').trim();
+    if (!full) return res.json({ card: null });
+
+    const focus = lastTail(full, 25);
+
+    const prompt = `
+You are an assistant for an English teacher. Analyze ONLY this short tail of the student's speech:
+"${focus}"
+
+Produce a STRICT JSON with THREE top-level arrays (even if some are empty):
+{
+  "errors": [
+    {
+      "title": "Short label like 'Missing article' or 'Grammar mistake'",
+      "wrong": "short example from the utterance (incorrect)",
+      "fix": "corrected short version",
+      "explanation": "Brief A2-level reason (<=200 chars)"
+    }
+  ],
+  "definitions": [
+    { "word": "word", "pos": "noun|verb|adj", "simple_def": "Very simple definition (A1-A2)" }
+  ],
+  "synonyms": [
+    { "word": "word", "pos": "noun|verb|adj", "list": ["syn1","syn2","syn3"] }
+  ]
+}
+
+Rules:
+- errors: 0–2 items.
+- definitions: 1–3 items (pick nouns/verbs/adjectives from the utterance).
+- synonyms: 1–3 items with 2–5 synonyms each. If no good candidate found, reuse one from definitions.
+- Use simple English. No prose outside of JSON.
+`;
+
+    let card = { errors: [], definitions: [], synonyms: [] };
+    try {
+      const resp = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        max_tokens: 380,
+        messages: [
+          { role: 'system', content: 'Return ONLY valid JSON. No markdown. No commentary.' },
+          { role: 'user', content: prompt }
+        ]
+      });
+      const raw = resp.choices?.[0]?.message?.content?.trim() || '{}';
+      const parsed = JSON.parse(raw);
+      card.errors = Array.isArray(parsed.errors) ? parsed.errors : [];
+      card.definitions = Array.isArray(parsed.definitions) ? parsed.definitions : [];
+      card.synonyms = Array.isArray(parsed.synonyms) ? parsed.synonyms : [];
+    } catch (e) {
+      console.error('LLM error', e?.message);
+    }
+
+    res.json({ card, focus });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
   }
-  if (!supportsSR()) {
-    alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
-  }
+});
 
-  function tail(text, maxWords=25){
-    const words = (text||"").trim().split(/\s+/);
-    return words.slice(-maxWords).join(" ").toLowerCase();
-  }
+app.use(express.static('client'));
+app.get('/', (req, res) => res.redirect('/teacher.html'));
 
-  function initRecog(lang='en-US') {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    recog = new SR();
-    recog.lang = lang;
-    recog.interimResults = true;
-    recog.continuous = true;
-
-    recog.onresult = async (e) => {
-      let interim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        if (r.isFinal) {
-          const piece = r[0].transcript.trim();
-          if (!piece) continue;
-
-          fullText += (fullText ? ' ' : '') + piece;
-          out.textContent = fullText;
-
-          // --- ДЕДУП: отправляем только НОВЫЙ "хвост"
-          const t = tail(fullText, 25);
-          if (t && t !== lastSentTail) {
-            lastSentTail = t;
-            try {
-              const resp = await fetch('/api/hints', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: fullText })
-              });
-              const data = await resp.json();
-              if (data && data.card) prependCard(data.card);
-            } catch (e) { console.warn('Hints error', e); }
-          }
-        } else {
-          interim += r[0].transcript;
-        }
-      }
-      if (interim) out.textContent = (fullText + ' ' + interim).trim();
-    };
-
-    recog.onerror = (e) => {
-      console.warn('SpeechRecognition error', e);
-      statusEl.textContent = "error (speech)";
-      statusEl.className = "warn";
-    };
-
-    // --- АВТО-ПЕРЕЗАПУСК: SR иногда завершает сессию при паузе.
-    recog.onend = () => {
-      if (keepListening) {
-        try { recog.start(); } catch {}
-      } else {
-        stopUI();
-      }
-    };
-  }
-
-  function prependCard(card){
-    const entry = document.createElement('div');
-    entry.className = 'entry';
-    entry.innerHTML = `
-      <div class="cols">
-        <div class="col error">
-          <h4>Errors & Fix</h4>
-          <div class="list errors"></div>
-        </div>
-        <div class="col def">
-          <h4>Definitions</h4>
-          <div class="list defs"></div>
-        </div>
-        <div class="col syn">
-          <h4>Synonyms</h4>
-          <div class="list syns"></div>
-        </div>
-      </div>
-    `;
-
-    const errsWrap = entry.querySelector('.errors');
-    (card.errors || []).forEach(e => {
-      const div = document.createElement('div');
-      div.className = 'errItem';
-      div.innerHTML = `
-        <div class="errTitle">${e.title || 'Mistake'}</div>
-        ${e.wrong ? `<div class="wrong">❌ ${e.wrong}</div>` : ''}
-        ${e.fix ? `<div class="fix">✅ ${e.fix}</div>` : ''}
-        ${e.explanation ? `<div class="ex">${e.explanation}</div>` : ''}
-      `;
-      errsWrap.appendChild(div);
-    });
-
-    const defsWrap = entry.querySelector('.defs');
-    (card.definitions || []).forEach(d => {
-      const div = document.createElement('div');
-      div.className = 'defItem';
-      div.innerHTML = `<div class="word">${d.word || ''} (${d.pos || ''})</div>
-                       <div>${d.simple_def || ''}</div>`;
-      defsWrap.appendChild(div);
-    });
-
-    const synsWrap = entry.querySelector('.syns');
-    (card.synonyms || []).forEach(s => {
-      const div = document.createElement('div');
-      div.className = 'synItem';
-      const list = (s.list || []).join(', ');
-      div.innerHTML = `<div class="word">${s.word || ''} (${s.pos || ''})</div>
-                       <div>${list}</div>`;
-      synsWrap.appendChild(div);
-    });
-
-    // Даже если пусто, 3 колонки остаются — так ты всегда видишь структуру.
-    feed.prepend(entry);
-
-    // ограничим историю 20 карточками
-    const max = 20;
-    while (feed.children.length > max) feed.removeChild(feed.lastChild);
-  }
-
-  function startUI(){
-    micBtn.disabled = true;
-    stopBtn.disabled = false;
-    statusEl.textContent = "listening (mic)";
-    statusEl.className = "ok";
-    // держим Render бодрым, пока страница открыта
-    if (!pingTimer) pingTimer = setInterval(() => { fetch('/api/health').catch(()=>{}); }, 20000);
-  }
-  function stopUI(){
-    stopBtn.disabled = true;
-    micBtn.disabled = false;
-    statusEl.textContent = "stopped";
-    statusEl.className = "";
-    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-  }
-
-  async function startMic() {
-    if (!supportsSR()) return alert('Update Chrome.');
-    if (!recog) initRecog('en-US');
-    fullText = "";
-    lastSentTail = "";
-    out.textContent = "Listening via Microphone…";
-    keepListening = true;
-    startUI();
-    try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
-    try { recog.start(); } catch {}
-  }
-
-  function stopAll() {
-    keepListening = false;
-    try { recog && recog.stop(); } catch {}
-    stopUI();
-  }
-
-  micBtn.onclick = startMic;
-  stopBtn.onclick = stopAll;
-
-  // --- Quick test (manual) если добавлял поле “Quick test”
-  const manualBtn = document.getElementById('sendManual');
-  if (manualBtn){
-    manualBtn.onclick = async () => {
-      const t = document.getElementById('manualText').value.trim();
-      if (!t) return;
-      fullText = fullText ? (fullText + ' ' + t) : t;
-      out.textContent = fullText;
-      lastSentTail = tail(fullText, 25);
-      try {
-        const resp = await fetch('/api/hints', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ text: fullText })
-        });
-        const data = await resp.json();
-        if (data && data.card) prependCard(data.card);
-      } catch(e){ console.warn(e); }
-    };
-  }
-</script>
+app.listen(PORT, () => {
+  console.log(`Teacher-only AI Tutor running: http://localhost:${PORT}/teacher.html`);
+});
