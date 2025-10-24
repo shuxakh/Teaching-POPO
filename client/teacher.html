@@ -11,6 +11,13 @@
       --muted:#666;
       --error-bg:#ffe9d6;
       --error-border:#ffb980;
+
+      --def-bg:#efe7ff;   /* фиолетовые */
+      --def-border:#c9b6ff;
+
+      --syn-bg:#e8f7e8;   /* зелёные */
+      --syn-border:#b8e6b8;
+
       --col-gap:12px;
     }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background:#fafbff;}
@@ -24,13 +31,19 @@
     .ok { color: #1b5e20; }
     .warn { color: #b71c1c; }
 
-    /* FEED: новые карточки сверху (prepend) */
+    .topgrid { display:grid; grid-template-columns: 1fr 320px; gap:12px; align-items:start; }
+    @media (max-width: 900px) { .topgrid { grid-template-columns: 1fr; } }
+
+    /* FEED: новые карточки сверху */
     .feed { display:flex; flex-direction: column; gap: 12px; }
     .entry { border:1px solid var(--border); border-radius:14px; padding:12px; background:#fff; }
     .cols { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--col-gap); }
     .col { border:1px solid var(--border); border-radius:12px; padding:10px; background:#fff; }
     .col h4 { margin:0 0 8px 0; }
+
     .error { background:var(--error-bg); border-color: var(--error-border); }
+    .def   { background:var(--def-bg);   border-color: var(--def-border); }
+    .syn   { background:var(--syn-bg);   border-color: var(--syn-border); }
 
     .errItem { background:var(--error-bg); border:1px solid var(--error-border); border-radius:10px; padding:10px; margin:8px 0; }
     .errTitle { font-weight:700; color:#b45309; }
@@ -38,10 +51,15 @@
     .fix { font-weight:700; margin-top:4px; }
     .ex { color:#444; margin-top:4px; }
 
-    .defItem, .synItem { background:#f9fafb; border:1px solid var(--border); border-radius:10px; padding:10px; margin:8px 0; }
+    .defItem { background:#f6f0ff; border:1px solid var(--def-border); border-radius:10px; padding:10px; margin:8px 0; }
+    .synItem { background:#f0fff0; border:1px solid var(--syn-border); border-radius:10px; padding:10px; margin:8px 0; }
     .word { font-weight:700; }
 
     @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+    /* компактное поле Quick test */
+    .quick input { width: 100%; padding: 10px; border:1px solid #ddd; border-radius:10px;}
+    .quick button { padding: 10px 12px; }
   </style>
 </head>
 <body>
@@ -49,28 +67,30 @@
     <h1>Teacher Panel — Private AI Hints</h1>
     <p class="note">Chrome only. Choose audio source → start → AI will show brief, structured hints only here.</p>
 
-    <div class="card">
-      <div class="row">
-        <label>Audio source:</label>
-        <button id="micBtn">🎙️ Microphone</button>
-        <button id="tabBtn">🖥️ Capture a Chrome Tab (with audio)</button>
-        <button id="stopBtn" disabled>⏹️ Stop</button>
+    <div class="topgrid">
+      <!-- левая карточка: выбор источника -->
+      <div class="card">
+        <div class="row">
+          <label>Audio source:</label>
+          <button id="micBtn">🎙️ Microphone</button>
+          <button id="tabBtn">🖥️ Capture a Chrome Tab (with audio)</button>
+          <button id="stopBtn" disabled>⏹️ Stop</button>
+        </div>
+        <p class="note">
+          <b>Capture Tab:</b> выбери вкладку и отметь “Share tab audio”. Мы проигрываем звук вкладки через динамики,
+          а распознаёт микрофон (ограничение Web Speech API). Для идеала позже подключим серверный Whisper.
+        </p>
       </div>
-      <p class="note">
-        <b>Capture Tab:</b> выбери вкладку и отметь “Share tab audio”. Браузерное распознавание не может напрямую читать этот поток,
-        поэтому мы **воспроизводим звук вкладки через динамики**, а распознаёт микрофон (как в первой версии).
-        Для идеального качества позже подключим серверный Whisper.
-      </p>
-    </div>
 
-    <!-- Быстрый тест без микрофона -->
-    <div class="card">
-      <h3>Quick test (no mic)</h3>
-      <div class="row">
-        <input id="manualText" style="flex:1; padding:10px; border:1px solid #ddd; border-radius:10px" placeholder="Type a sentence here...">
-        <button id="sendManual">Send</button>
+      <!-- правая маленькая карточка: Quick test -->
+      <div class="card quick">
+        <h3 style="margin-top:0">Quick test</h3>
+        <div class="row" style="gap:8px">
+          <input id="manualText" placeholder="Type a word or phrase…">
+          <button id="sendManual">Send</button>
+        </div>
+        <p class="note" style="margin:8px 0 0">Напиши слово/фразу, если его ещё не произнесли.</p>
       </div>
-      <p class="note">Нужно, чтобы проверить AI, даже если микрофон не доступен.</p>
     </div>
 
     <h3>Live transcript</h3>
@@ -83,7 +103,6 @@
   </div>
 
   <script>
-    // DOM
     const statusEl = document.getElementById('status');
     const out = document.getElementById('transcript');
     const feed = document.getElementById('feed');
@@ -91,22 +110,22 @@
     const tabBtn = document.getElementById('tabBtn');
     const stopBtn = document.getElementById('stopBtn');
 
-    // State
     let recog = null;
     let keepListening = false;
     let fullText = "";
     let lastSentTail = "";
     let pingTimer = null;
-    let tabAudioEl = null;   // для захвата вкладки
+    let tabAudioEl = null;
+    let inactivityTimer = null;       // <-- ТАЙМ-АУТ ПАУЗЫ
 
-    // Helpers
     function supportsSR() {
       return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
     }
-    function tail(text, maxWords=25){
+    function tail(text, maxWords=20){
       const words = (text||"").trim().split(/\s+/);
       return words.slice(-maxWords).join(" ").toLowerCase();
     }
+
     function startUI(mode){
       micBtn.disabled = true;
       tabBtn.disabled = true;
@@ -122,14 +141,21 @@
       statusEl.textContent = "stopped";
       statusEl.className = "";
       if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+      clearTimeout(inactivityTimer);
     }
 
-    // SpeechRecognition
+    function scheduleClearAfterPause(ms=4000){
+      clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        // новая «сцена»: очищаем live и контекст
+        fullText = "";
+        lastSentTail = "";
+        out.textContent = "—";
+      }, ms);
+    }
+
     function initRecog(lang='en-US') {
-      if (!supportsSR()) {
-        alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
-        return;
-      }
+      if (!supportsSR()) { alert("Update Chrome for SpeechRecognition API."); return; }
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       recog = new SR();
       recog.lang = lang;
@@ -143,10 +169,11 @@
           if (r.isFinal) {
             const piece = r[0].transcript.trim();
             if (!piece) continue;
+
             fullText += (fullText ? ' ' : '') + piece;
             out.textContent = fullText;
 
-            const t = tail(fullText, 25);
+            const t = tail(fullText, 20);
             if (t && t !== lastSentTail) {
               lastSentTail = t;
               try {
@@ -159,6 +186,7 @@
                 if (data && data.card) prependCard(data.card);
               } catch (e) { console.warn('Hints error', e); }
             }
+            scheduleClearAfterPause(); // перезапускаем таймер очистки при каждом финальном фрагменте
           } else {
             interim += r[0].transcript;
           }
@@ -181,7 +209,6 @@
       };
     }
 
-    // UI actions
     async function startMic(){
       if (!recog) initRecog('en-US');
       fullText = ""; lastSentTail = "";
@@ -189,32 +216,30 @@
       keepListening = true;
       startUI('mic');
       try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
+      scheduleClearAfterPause();
       try { recog.start(); } catch {}
     }
 
     async function startTabCapture(){
       if (!recog) initRecog('en-US');
       fullText = ""; lastSentTail = "";
-      out.textContent = "Listening to captured tab… (make sure system volume is audible)";
+      out.textContent = "Listening to captured tab… (turn speakers on)";
       keepListening = true;
       startUI('tab');
 
-      // Захватываем вкладку с аудио и проигрываем её через динамики,
-      // чтобы микрофон “слышал” звук вкладки (ограничение Web Speech API).
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-        // создаём аудио-элемент для вывода звука
         if (tabAudioEl) { try { tabAudioEl.pause(); } catch{} }
         tabAudioEl = new Audio();
         tabAudioEl.srcObject = stream;
-        tabAudioEl.muted = false;   // ВКЛЮЧАЕМ звук захваченной вкладки наружу
+        tabAudioEl.muted = false;
         tabAudioEl.play().catch(()=>{});
       } catch (e) {
-        alert('Tab capture was cancelled. You can use Microphone option instead.');
+        alert('Tab capture was cancelled. You can use Microphone instead.');
         stopAll();
         return;
       }
-
+      scheduleClearAfterPause();
       try { recog.start(); } catch {}
     }
 
@@ -282,7 +307,6 @@
       while (feed.children.length > max) feed.removeChild(feed.lastChild);
     }
 
-    // Bind
     document.addEventListener('DOMContentLoaded', () => {
       micBtn.disabled = false;
       tabBtn.disabled = false;
@@ -290,14 +314,13 @@
       tabBtn.onclick = startTabCapture;
       stopBtn.onclick = stopAll;
 
-      // Quick test (manual)
-      const manualBtn = document.getElementById('sendManual');
-      manualBtn.onclick = async () => {
+      // Quick test
+      document.getElementById('sendManual').onclick = async () => {
         const t = document.getElementById('manualText').value.trim();
         if (!t) return;
         fullText = fullText ? (fullText + ' ' + t) : t;
         out.textContent = fullText;
-        lastSentTail = tail(fullText, 25);
+        lastSentTail = tail(fullText, 20);
         try {
           const resp = await fetch('/api/hints', {
             method:'POST',
@@ -307,6 +330,7 @@
           const data = await resp.json();
           if (data && data.card) prependCard(data.card);
         } catch(e){ console.warn(e); }
+        scheduleClearAfterPause();
       };
     });
   </script>
