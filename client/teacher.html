@@ -5,44 +5,74 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Teacher — AI Hints (Private)</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    .wrap { max-width: 900px; margin: 0 auto; }
+    :root{
+      --card:#fff;
+      --border:#e6e7ef;
+      --muted:#666;
+      --hint-bg:#fff8e1;
+      --hint-border:#ffe082;
+      --error-bg:#ffe9d6;
+      --error-border:#ffb980;
+      --col-gap:12px;
+    }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background:#fafbff;}
+    .wrap { max-width: 1100px; margin: 0 auto; }
     .row { display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
-    .live { background:#f6f7fb; padding:12px; border-radius:12px; min-height:70px; border:1px solid #e6e7ef; }
-    .hint { background:#fff8e1; border:1px solid #ffe082; border-radius:12px; padding:10px; margin:8px 0; }
-    .fix { font-weight:600; }
+    .card { border:1px solid var(--border); border-radius:14px; padding:14px; background:var(--card); margin-bottom:12px; }
+    .live { background:#f6f7fb; padding:12px; border-radius:12px; min-height:70px; border:1px solid var(--border); }
     button { padding:10px 14px; border-radius:10px; border:1px solid #d0d3db; background:#fff; cursor:pointer; }
     button:disabled { opacity:.6; cursor:not-allowed; }
-    .note { color:#666; font-size: 0.95rem; }
+    .note { color:var(--muted); font-size: 0.95rem; }
     .ok { color: #1b5e20; }
     .warn { color: #b71c1c; }
-    .card { border:1px solid #e6e7ef; border-radius:14px; padding:14px; background:#fff; }
-    label { font-weight: 600; }
+
+    /* feed */
+    .feed { display:flex; flex-direction: column-reverse; gap: 12px; } /* новые сверху: мы будем prepend */
+    .entry { border:1px solid var(--border); border-radius:14px; padding:12px; background:#fff; }
+    .cols { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--col-gap); }
+    .col { border:1px solid var(--border); border-radius:12px; padding:10px; background:#fff; }
+    .col h4 { margin:0 0 8px 0; }
+    .error { background:var(--error-bg); border-color: var(--error-border); }
+    .def  { }
+    .syn  { }
+
+    .errItem { background:var(--error-bg); border:1px solid var(--error-border); border-radius:10px; padding:10px; margin:8px 0; }
+    .errTitle { font-weight:700; color:#b45309; }
+    .wrong { margin-top:6px; }
+    .fix { font-weight:700; margin-top:4px; }
+    .ex { color:#444; margin-top:4px; }
+
+    .defItem, .synItem { background:#f9fafb; border:1px solid var(--border); border-radius:10px; padding:10px; margin:8px 0; }
+    .word { font-weight:700; }
+
+    @media (max-width: 900px) {
+      .cols { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Teacher Panel — Private AI Hints</h1>
-    <p class="note">Chrome only. Choose audio source → start → AI will show brief hints only here.</p>
+    <p class="note">Chrome only. Choose audio source → start → AI will show brief, structured hints only here.</p>
 
     <div class="card">
       <div class="row">
         <label>Audio source:</label>
         <button id="micBtn">🎙️ Microphone</button>
-        <button id="tabBtn">🔊 Capture a Chrome Tab (with audio)</button>
+        <button id="tabBtn" disabled title="(в этой версии SR не читает звук вкладки напрямую)">🔊 Capture a Chrome Tab</button>
         <button id="stopBtn" disabled>⏹️ Stop</button>
       </div>
       <p class="note">
-        <b>Microphone:</b> place laptop speakers on so it hears the student.<br>
-        <b>Tab capture:</b> if the student speaks in a Chrome tab (Meet/Zoom web), capture that tab with audio.
+        *Для лучшей раздельности сейчас используйте только <b>один</b> источник — микрофон (наушники учителю, чтобы его голос не попадал в микрофон).  
+        Отдельный выбор источника и серверный STT подключим на следующем шаге (Whisper).
       </p>
     </div>
 
     <h3>Live transcript</h3>
     <div id="transcript" class="live">—</div>
 
-    <h3>AI hints for teacher</h3>
-    <div id="hints"></div>
+    <h3>AI hints for teacher (newest on top)</h3>
+    <div id="feed" class="feed"></div>
 
     <p class="note">Status: <span id="status">idle</span></p>
   </div>
@@ -50,7 +80,7 @@
   <script>
     const statusEl = document.getElementById('status');
     const out = document.getElementById('transcript');
-    const hintsWrap = document.getElementById('hints');
+    const feed = document.getElementById('feed');
     const micBtn = document.getElementById('micBtn');
     const tabBtn = document.getElementById('tabBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -80,7 +110,8 @@
           if (r.isFinal) {
             fullText += (fullText ? ' ' : '') + r[0].transcript.trim();
             out.textContent = fullText;
-            // ask server for hints
+
+            // отправляем на сервер ТОЛЬКО когда появилось финальное добавление
             try {
               const resp = await fetch('/api/hints', {
                 method: 'POST',
@@ -88,10 +119,8 @@
                 body: JSON.stringify({ text: fullText })
               });
               const data = await resp.json();
-              renderHints(data.hints || []);
-            } catch (e) {
-              console.warn('Hints error', e);
-            }
+              if (data && data.card) prependCard(data.card);
+            } catch (e) { console.warn('Hints error', e); }
           } else {
             interim += r[0].transcript;
           }
@@ -109,21 +138,75 @@
         running = false;
         stopBtn.disabled = true;
         micBtn.disabled = false;
-        tabBtn.disabled = false;
         statusEl.textContent = "stopped";
         statusEl.className = "";
       };
     }
 
-    function renderHints(list) {
-      hintsWrap.innerHTML = "";
-      list.forEach(h => {
+    function prependCard(card){
+      // создаём карточку с 3 колонками
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      entry.innerHTML = `
+        <div class="cols">
+          <div class="col error">
+            <h4>Errors & Fix</h4>
+            <div class="list errors"></div>
+          </div>
+          <div class="col def">
+            <h4>Definitions</h4>
+            <div class="list defs"></div>
+          </div>
+          <div class="col syn">
+            <h4>Synonyms</h4>
+            <div class="list syns"></div>
+          </div>
+        </div>
+      `;
+
+      const errsWrap = entry.querySelector('.errors');
+      (card.errors || []).forEach(e => {
         const div = document.createElement('div');
-        div.className = 'hint';
-        div.innerHTML = `<div><b>${h.type || 'general'}</b>: ${h.hint || ''}</div>` +
-                        (h.fix ? `<div class="fix">${h.fix}</div>` : '');
-        hintsWrap.appendChild(div);
+        div.className = 'errItem';
+        div.innerHTML = `
+          <div class="errTitle">${e.title || 'Mistake'}</div>
+          ${e.wrong ? `<div class="wrong">❌ ${e.wrong}</div>` : ''}
+          ${e.fix ? `<div class="fix">✅ ${e.fix}</div>` : ''}
+          ${e.explanation ? `<div class="ex">${e.explanation}</div>` : ''}
+        `;
+        errsWrap.appendChild(div);
       });
+
+      const defsWrap = entry.querySelector('.defs');
+      (card.definitions || []).forEach(d => {
+        const div = document.createElement('div');
+        div.className = 'defItem';
+        div.innerHTML = `<div class="word">${d.word || ''} (${d.pos || ''})</div>
+                         <div>${d.simple_def || ''}</div>`;
+        defsWrap.appendChild(div);
+      });
+
+      const synsWrap = entry.querySelector('.syns');
+      (card.synonyms || []).forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'synItem';
+        const list = (s.list || []).join(', ');
+        div.innerHTML = `<div class="word">${s.word || ''} (${s.pos || ''})</div>
+                         <div>${list}</div>`;
+        synsWrap.appendChild(div);
+      });
+
+      // если секция пустая — прячем колонку
+      if (!(card.errors || []).length) entry.querySelector('.error').style.display='none';
+      if (!(card.definitions || []).length) entry.querySelector('.def').style.display='none';
+      if (!(card.synonyms || []).length) entry.querySelector('.syn').style.display='none';
+
+      // добавляем в начало ленты (новые сверху)
+      feed.prepend(entry);
+
+      // ограничим историю, например, 20 карточек
+      const max = 20;
+      while (feed.children.length > max) feed.removeChild(feed.lastChild);
     }
 
     async function startMic() {
@@ -132,58 +215,23 @@
       fullText = "";
       out.textContent = "Listening via Microphone…";
       micBtn.disabled = true;
-      tabBtn.disabled = true;
       stopBtn.disabled = false;
-      running = true;
       statusEl.textContent = "listening (mic)";
       statusEl.className = "ok";
-      try {
-        await navigator.mediaDevices.getUserMedia({ audio: true }); // just to request permission early
-      } catch {}
-      recog.start();
-    }
-
-    async function startTabCapture() {
-      if (!supportsSR()) return alert('Update Chrome.');
-      if (!recog) initRecog('en-US');
-      fullText = "";
-      out.textContent = "Listening to a captured tab (enable audio)…";
-      micBtn.disabled = true;
-      tabBtn.disabled = true;
-      stopBtn.disabled = false;
-      running = true;
-      statusEl.textContent = "listening (tab)";
-      statusEl.className = "ok";
-
-      // Capture a tab with audio. Chrome will ask to choose a tab and "Share tab audio".
-      try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-        // Route the captured audio into the SR engine by making it the default mic via system? Not possible directly.
-        // Workaround: Create an audio element so you can monitor, but SR still listens to the default mic.
-        // Practical approach: turn on tab's audio on speakers so mic picks it.
-        const audioEl = new Audio();
-        audioEl.srcObject = stream;
-        audioEl.muted = false; // play captured tab audio out loud so mic can hear it
-        audioEl.play().catch(()=>{});
-      } catch (e) {
-        alert('Tab capture cancelled. You can use Microphone option instead.');
-        micBtn.disabled = false;
-        tabBtn.disabled = false;
-        stopBtn.disabled = true;
-        running = false;
-        return;
-      }
+      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
       recog.start();
     }
 
     function stopAll() {
-      if (recog && running) {
-        try { recog.stop(); } catch {}
-      }
+      if (recog && running) { try { recog.stop(); } catch {} }
+      running = false;
+      stopBtn.disabled = true;
+      micBtn.disabled = false;
+      statusEl.textContent = "stopped";
+      statusEl.className = "";
     }
 
-    micBtn.onclick = startMic;
-    tabBtn.onclick = startTabCapture;
+    micBtn.onclick = () => { running = true; startMic(); };
     stopBtn.onclick = stopAll;
   </script>
 </body>
