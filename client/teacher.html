@@ -9,8 +9,6 @@
       --card:#fff;
       --border:#e6e7ef;
       --muted:#666;
-      --hint-bg:#fff8e1;
-      --hint-border:#ffe082;
       --error-bg:#ffe9d6;
       --error-border:#ffb980;
       --col-gap:12px;
@@ -26,15 +24,13 @@
     .ok { color: #1b5e20; }
     .warn { color: #b71c1c; }
 
-    /* feed */
-    .feed { display:flex; flex-direction: column-reverse; gap: 12px; } /* новые сверху: мы будем prepend */
+    /* FEED: новые карточки вставляем сверху через prepend() */
+    .feed { display:flex; flex-direction: column; gap: 12px; }
     .entry { border:1px solid var(--border); border-radius:14px; padding:12px; background:#fff; }
     .cols { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--col-gap); }
     .col { border:1px solid var(--border); border-radius:12px; padding:10px; background:#fff; }
     .col h4 { margin:0 0 8px 0; }
     .error { background:var(--error-bg); border-color: var(--error-border); }
-    .def  { }
-    .syn  { }
 
     .errItem { background:var(--error-bg); border:1px solid var(--error-border); border-radius:10px; padding:10px; margin:8px 0; }
     .errTitle { font-weight:700; color:#b45309; }
@@ -59,13 +55,22 @@
       <div class="row">
         <label>Audio source:</label>
         <button id="micBtn">🎙️ Microphone</button>
-        <button id="tabBtn" disabled title="(в этой версии SR не читает звук вкладки напрямую)">🔊 Capture a Chrome Tab</button>
         <button id="stopBtn" disabled>⏹️ Stop</button>
       </div>
       <p class="note">
-        *Для лучшей раздельности сейчас используйте только <b>один</b> источник — микрофон (наушники учителю, чтобы его голос не попадал в микрофон).  
-        Отдельный выбор источника и серверный STT подключим на следующем шаге (Whisper).
+        *Пока используем один источник — микрофон (лучше наушники учителю, чтобы его голос не попадал в микрофон).
+        Позже подключим серверный Whisper и раздельные каналы.
       </p>
+    </div>
+
+    <!-- Быстрый тест без микрофона -->
+    <div class="card">
+      <h3>Quick test (no mic)</h3>
+      <div class="row">
+        <input id="manualText" style="flex:1; padding:10px; border:1px solid #ddd; border-radius:10px" placeholder="Type a sentence here...">
+        <button id="sendManual">Send</button>
+      </div>
+      <p class="note">Нужно, чтобы проверить AI, даже если микрофон не доступен.</p>
     </div>
 
     <h3>Live transcript</h3>
@@ -74,7 +79,7 @@
     <h3>AI hints for teacher (newest on top)</h3>
     <div id="feed" class="feed"></div>
 
-    <p class="note">Status: <span id="status">idle</span></p>
+    <p class="note">Status: <span id="status">stopped</span></p>
   </div>
 
   <script>
@@ -82,18 +87,24 @@
     const out = document.getElementById('transcript');
     const feed = document.getElementById('feed');
     const micBtn = document.getElementById('micBtn');
-    const tabBtn = document.getElementById('tabBtn');
     const stopBtn = document.getElementById('stopBtn');
 
     let recog = null;
-    let running = false;
+    let keepListening = false;
     let fullText = "";
+    let lastSentTail = "";
+    let pingTimer = null;
 
     function supportsSR() {
       return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
     }
     if (!supportsSR()) {
       alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
+    }
+
+    function tail(text, maxWords=25){
+      const words = (text||"").trim().split(/\s+/);
+      return words.slice(-maxWords).join(" ").toLowerCase();
     }
 
     function initRecog(lang='en-US') {
@@ -108,131 +119,18 @@
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const r = e.results[i];
           if (r.isFinal) {
-            fullText += (fullText ? ' ' : '') + r[0].transcript.trim();
+            const piece = r[0].transcript.trim();
+            if (!piece) continue;
+
+            fullText += (fullText ? ' ' : '') + piece;
             out.textContent = fullText;
 
-            // отправляем на сервер ТОЛЬКО когда появилось финальное добавление
-            try {
-              const resp = await fetch('/api/hints', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: fullText })
-              });
-              const data = await resp.json();
-              if (data && data.card) prependCard(data.card);
-            } catch (e) { console.warn('Hints error', e); }
-          } else {
-            interim += r[0].transcript;
-          }
-        }
-        if (interim) out.textContent = (fullText + ' ' + interim).trim();
-      };
-
-      recog.onerror = (e) => {
-        console.warn('SpeechRecognition error', e);
-        statusEl.textContent = "error (speech)";
-        statusEl.className = "warn";
-      };
-
-      recog.onend = () => {
-        running = false;
-        stopBtn.disabled = true;
-        micBtn.disabled = false;
-        statusEl.textContent = "stopped";
-        statusEl.className = "";
-      };
-    }
-
-    function prependCard(card){
-      // создаём карточку с 3 колонками
-      const entry = document.createElement('div');
-      entry.className = 'entry';
-      entry.innerHTML = `
-        <div class="cols">
-          <div class="col error">
-            <h4>Errors & Fix</h4>
-            <div class="list errors"></div>
-          </div>
-          <div class="col def">
-            <h4>Definitions</h4>
-            <div class="list defs"></div>
-          </div>
-          <div class="col syn">
-            <h4>Synonyms</h4>
-            <div class="list syns"></div>
-          </div>
-        </div>
-      `;
-
-      const errsWrap = entry.querySelector('.errors');
-      (card.errors || []).forEach(e => {
-        const div = document.createElement('div');
-        div.className = 'errItem';
-        div.innerHTML = `
-          <div class="errTitle">${e.title || 'Mistake'}</div>
-          ${e.wrong ? `<div class="wrong">❌ ${e.wrong}</div>` : ''}
-          ${e.fix ? `<div class="fix">✅ ${e.fix}</div>` : ''}
-          ${e.explanation ? `<div class="ex">${e.explanation}</div>` : ''}
-        `;
-        errsWrap.appendChild(div);
-      });
-
-      const defsWrap = entry.querySelector('.defs');
-      (card.definitions || []).forEach(d => {
-        const div = document.createElement('div');
-        div.className = 'defItem';
-        div.innerHTML = `<div class="word">${d.word || ''} (${d.pos || ''})</div>
-                         <div>${d.simple_def || ''}</div>`;
-        defsWrap.appendChild(div);
-      });
-
-      const synsWrap = entry.querySelector('.syns');
-      (card.synonyms || []).forEach(s => {
-        const div = document.createElement('div');
-        div.className = 'synItem';
-        const list = (s.list || []).join(', ');
-        div.innerHTML = `<div class="word">${s.word || ''} (${s.pos || ''})</div>
-                         <div>${list}</div>`;
-        synsWrap.appendChild(div);
-      });
-
-      // если секция пустая — прячем колонку
-      if (!(card.errors || []).length) entry.querySelector('.error').style.display='none';
-      if (!(card.definitions || []).length) entry.querySelector('.def').style.display='none';
-      if (!(card.synonyms || []).length) entry.querySelector('.syn').style.display='none';
-
-      // добавляем в начало ленты (новые сверху)
-      feed.prepend(entry);
-
-      // ограничим историю, например, 20 карточек
-      const max = 20;
-      while (feed.children.length > max) feed.removeChild(feed.lastChild);
-    }
-
-    async function startMic() {
-      if (!supportsSR()) return alert('Update Chrome.');
-      if (!recog) initRecog('en-US');
-      fullText = "";
-      out.textContent = "Listening via Microphone…";
-      micBtn.disabled = true;
-      stopBtn.disabled = false;
-      statusEl.textContent = "listening (mic)";
-      statusEl.className = "ok";
-      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
-      recog.start();
-    }
-
-    function stopAll() {
-      if (recog && running) { try { recog.stop(); } catch {} }
-      running = false;
-      stopBtn.disabled = true;
-      micBtn.disabled = false;
-      statusEl.textContent = "stopped";
-      statusEl.className = "";
-    }
-
-    micBtn.onclick = () => { running = true; startMic(); };
-    stopBtn.onclick = stopAll;
-  </script>
-</body>
-</html>
+            // отправляем только если хвост изменился (анти-дубль)
+            const t = tail(fullText, 25);
+            if (t && t !== lastSentTail) {
+              lastSentTail = t;
+              try {
+                const resp = await fetch('/api/hints', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body:
