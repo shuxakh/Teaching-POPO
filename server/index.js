@@ -15,7 +15,7 @@ function lastTail(text, maxWords = 25) {
   return words.slice(-maxWords).join(' ');
 }
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/hints', async (req, res) => {
   try {
@@ -81,7 +81,7 @@ Rules:
 });
 
 app.use(express.static('client'));
-app.get('/', (req, res) => res.redirect('/teacher.html'));
+app.get('/', (_req, res) => res.redirect('/teacher.html'));
 
 app.listen(PORT, () => {
   console.log(`Teacher-only AI Tutor running: http://localhost:${PORT}/teacher.html`);
