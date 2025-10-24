@@ -1,0 +1,190 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Teacher — AI Hints (Private)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
+    .live { background:#f6f7fb; padding:12px; border-radius:12px; min-height:70px; border:1px solid #e6e7ef; }
+    .hint { background:#fff8e1; border:1px solid #ffe082; border-radius:12px; padding:10px; margin:8px 0; }
+    .fix { font-weight:600; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #d0d3db; background:#fff; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .note { color:#666; font-size: 0.95rem; }
+    .ok { color: #1b5e20; }
+    .warn { color: #b71c1c; }
+    .card { border:1px solid #e6e7ef; border-radius:14px; padding:14px; background:#fff; }
+    label { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Teacher Panel — Private AI Hints</h1>
+    <p class="note">Chrome only. Choose audio source → start → AI will show brief hints only here.</p>
+
+    <div class="card">
+      <div class="row">
+        <label>Audio source:</label>
+        <button id="micBtn">🎙️ Microphone</button>
+        <button id="tabBtn">🔊 Capture a Chrome Tab (with audio)</button>
+        <button id="stopBtn" disabled>⏹️ Stop</button>
+      </div>
+      <p class="note">
+        <b>Microphone:</b> place laptop speakers on so it hears the student.<br>
+        <b>Tab capture:</b> if the student speaks in a Chrome tab (Meet/Zoom web), capture that tab with audio.
+      </p>
+    </div>
+
+    <h3>Live transcript</h3>
+    <div id="transcript" class="live">—</div>
+
+    <h3>AI hints for teacher</h3>
+    <div id="hints"></div>
+
+    <p class="note">Status: <span id="status">idle</span></p>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const out = document.getElementById('transcript');
+    const hintsWrap = document.getElementById('hints');
+    const micBtn = document.getElementById('micBtn');
+    const tabBtn = document.getElementById('tabBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
+    let recog = null;
+    let running = false;
+    let fullText = "";
+
+    function supportsSR() {
+      return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
+    }
+    if (!supportsSR()) {
+      alert("Your Chrome does not expose SpeechRecognition API. Please update Chrome.");
+    }
+
+    function initRecog(lang='en-US') {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recog = new SR();
+      recog.lang = lang;
+      recog.interimResults = true;
+      recog.continuous = true;
+
+      recog.onresult = async (e) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const r = e.results[i];
+          if (r.isFinal) {
+            fullText += (fullText ? ' ' : '') + r[0].transcript.trim();
+            out.textContent = fullText;
+            // ask server for hints
+            try {
+              const resp = await fetch('/api/hints', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: fullText })
+              });
+              const data = await resp.json();
+              renderHints(data.hints || []);
+            } catch (e) {
+              console.warn('Hints error', e);
+            }
+          } else {
+            interim += r[0].transcript;
+          }
+        }
+        if (interim) out.textContent = (fullText + ' ' + interim).trim();
+      };
+
+      recog.onerror = (e) => {
+        console.warn('SpeechRecognition error', e);
+        statusEl.textContent = "error (speech)";
+        statusEl.className = "warn";
+      };
+
+      recog.onend = () => {
+        running = false;
+        stopBtn.disabled = true;
+        micBtn.disabled = false;
+        tabBtn.disabled = false;
+        statusEl.textContent = "stopped";
+        statusEl.className = "";
+      };
+    }
+
+    function renderHints(list) {
+      hintsWrap.innerHTML = "";
+      list.forEach(h => {
+        const div = document.createElement('div');
+        div.className = 'hint';
+        div.innerHTML = `<div><b>${h.type || 'general'}</b>: ${h.hint || ''}</div>` +
+                        (h.fix ? `<div class="fix">${h.fix}</div>` : '');
+        hintsWrap.appendChild(div);
+      });
+    }
+
+    async function startMic() {
+      if (!supportsSR()) return alert('Update Chrome.');
+      if (!recog) initRecog('en-US');
+      fullText = "";
+      out.textContent = "Listening via Microphone…";
+      micBtn.disabled = true;
+      tabBtn.disabled = true;
+      stopBtn.disabled = false;
+      running = true;
+      statusEl.textContent = "listening (mic)";
+      statusEl.className = "ok";
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true }); // just to request permission early
+      } catch {}
+      recog.start();
+    }
+
+    async function startTabCapture() {
+      if (!supportsSR()) return alert('Update Chrome.');
+      if (!recog) initRecog('en-US');
+      fullText = "";
+      out.textContent = "Listening to a captured tab (enable audio)…";
+      micBtn.disabled = true;
+      tabBtn.disabled = true;
+      stopBtn.disabled = false;
+      running = true;
+      statusEl.textContent = "listening (tab)";
+      statusEl.className = "ok";
+
+      // Capture a tab with audio. Chrome will ask to choose a tab and "Share tab audio".
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        // Route the captured audio into the SR engine by making it the default mic via system? Not possible directly.
+        // Workaround: Create an audio element so you can monitor, but SR still listens to the default mic.
+        // Practical approach: turn on tab's audio on speakers so mic picks it.
+        const audioEl = new Audio();
+        audioEl.srcObject = stream;
+        audioEl.muted = false; // play captured tab audio out loud so mic can hear it
+        audioEl.play().catch(()=>{});
+      } catch (e) {
+        alert('Tab capture cancelled. You can use Microphone option instead.');
+        micBtn.disabled = false;
+        tabBtn.disabled = false;
+        stopBtn.disabled = true;
+        running = false;
+        return;
+      }
+      recog.start();
+    }
+
+    function stopAll() {
+      if (recog && running) {
+        try { recog.stop(); } catch {}
+      }
+    }
+
+    micBtn.onclick = startMic;
+    tabBtn.onclick = startTabCapture;
+    stopBtn.onclick = stopAll;
+  </script>
+</body>
+</html>
