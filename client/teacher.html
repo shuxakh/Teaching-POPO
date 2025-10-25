@@ -29,9 +29,11 @@
     .defItem{background:#f5f0ff;border:1px solid #c9b6ff}
     .synItem{background:#f0fff0;border:1px solid #b8e6b8}
     .note{color:#666;font-size:.9rem}
-    .diag{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b1020;color:#d9e1ff;border-radius:12px;border:1px solid #263056;padding:12px;line-height:1.35;overflow:auto}
+    .diag{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b1020;color:#d9e1ff;border-radius:12px;border:1px solid #263056;padding:12px;line-height:1.35;overflow:auto;position:relative}
     .ok{color:#9cff9c}.bad{color:#ff9c9c}.warn{color:#ffd27a}
     .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #445}
+    .ghost{position:absolute;right:8px;top:8px;opacity:.3}
+    .diag:hover .ghost{opacity:1}
   </style>
 </head>
 <body>
@@ -80,34 +82,38 @@
   <div id="feed" class="feed"></div>
 
   <h3 style="margin-top:16px">Diagnostics</h3>
-  <div id="diag" class="diag">idle</div>
+  <div id="diag" class="diag">
+    idle
+    <button id="forceFlush" class="ghost">Force flush</button>
+  </div>
 
   <p class="note" style="margin-top:8px">Status: <span id="status">idle</span></p>
 </div>
 
 <script>
-/* ====== глобальное состояние ====== */
+/*** ------- глобальное состояние ------- ***/
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let displayStream=null, srcStream=null, boostedStream=null, mediaRec=null;
 
 const MIME_CHAIN=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4',''];
 let mimeIdx=0;
 
-const CHUNK_MS=1000;     // частота кусочков от MediaRecorder
-const AGG_MS=4500;       // копим 4.5 c перед отправкой
-const HARD_FLUSH_MS=7000;// но максимум 7 c — отправляем даже если тихо
-const PAUSE_MS=4000;     // авто-очистка live
+const CHUNK_MS=1000;
+const AGG_MS=4500;        // нормальный флаш
+const HARD_FLUSH_MS=7000; // максимум ожидания
+const PAUSE_MS=4000;
 
 let tPauseTimer=null, sPauseTimer=null;
-let studentPulse=null, studentWatchdog=null, lastChunkTs=0, chunkCount=0, lastSize=0;
+let studentPulse=null, studentWatchdog=null, flushTicker=null;
+let lastChunkTs=0, chunkCount=0, lastSize=0;
 let studentStopRequested=false;
 
-// буфер для Whisper
 let aggBlobs=[], aggMs=0, aggStart=0, sttBusy=false;
 
-// WebAudio + VAD
 let audioCtx=null, analyser=null, gainNode=null, rms=0;
-const VAD_TH=0.003; // порог понижен
+const VAD_TH=0.003; // мягкий порог
+
+let flushCount=0, lastFlushAt='—';
 
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
@@ -115,22 +121,14 @@ const studentOut=document.getElementById('studentOut');
 const feed=document.getElementById('feed');
 const diagEl=document.getElementById('diag');
 
+/*** ------- утилиты ------- ***/
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
 function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function clearAfterPause(which){
-  if(which==='t'){
-    clearTimeout(tPauseTimer);
-    tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
-  }else{
-    clearTimeout(sPauseTimer);
-    sPauseTimer=setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS);
-  }
+  if(which==='t'){ clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS); }
+  else{ clearTimeout(sPauseTimer); sPauseTimer=setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS); }
 }
-function arrayBufferToBase64(buffer){
-  let binary=''; const bytes=new Uint8Array(buffer);
-  for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
+function arrayBufferToBase64(buffer){ let binary=''; const bytes=new Uint8Array(buffer); for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]); return btoa(binary); }
 function now(){return new Date().toLocaleTimeString();}
 function updateDiag(extra={}){
   const aTrack = boostedStream?.getAudioTracks?.()[0] || srcStream?.getAudioTracks?.()[0];
@@ -141,7 +139,7 @@ function updateDiag(extra={}){
   const recState = mediaRec?.state || '—';
   const aState = aTrack?.readyState || '—';
   const vState = vTrack?.readyState || '—';
-
+  diagEl.firstChild && (diagEl.firstChild.textContent = ''); // чистим "idle"
   diagEl.innerHTML = `
 time: ${now()}<br>
 recorder: <span class="${recState==='recording'?'ok':'warn'}">${recState}</span>
@@ -150,152 +148,99 @@ recorder: <span class="${recState==='recording'?'ok':'warn'}">${recState}</span>
   • lastSize: ${lastSize} bytes
   • lastChunkAge: ${age}
   • aggMs: ${aggMs}ms
-  • sttBusy: ${sttBusy}<br>
+  • sttBusy: ${sttBusy}
+  • flushes: ${flushCount}
+  • lastFlushAt: ${lastFlushAt}<br>
 audio track: <span class="${aState==='live'?'ok':'bad'}">${aState}</span>
-  • muted: ${aTrack?.muted??'—'}
-  • enabled: ${aTrack?.enabled??'—'}
   • level(RMS): ${level}
   • boost: x${(gainNode?.gain?.value||1).toFixed(1)}<br>
 video track: ${vState}<br>
 ${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
+<button id="forceFlush" class="ghost">Force flush</button>
 `.trim();
+  // заново повесим кнопку (innerHTML пересоздал её)
+  const ff=document.getElementById('forceFlush'); if(ff) ff.onclick=()=>flushAgg(true,true);
 }
 
-/* ====== Teacher (SpeechRecognition) ====== */
+/*** ------- Teacher (SpeechRecognition) ------- ***/
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
   SR=new S(); SR.lang='en-US'; SR.interimResults=true; SR.continuous=true;
-
   SR.onresult=async e=>{
-    let interim='';
-    for(let i=e.resultIndex;i<e.results.length;i++){
-      const r=e.results[i];
-      if(r.isFinal){
-        const piece=r[0].transcript.trim(); if(!piece) continue;
+    let interim=''; for(let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i];
+      if(r.isFinal){ const piece=r[0].transcript.trim(); if(!piece) continue;
         tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
         const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
         clearAfterPause('t');
-      } else {
-        interim+=r[0].transcript;
-      }
+      } else { interim+=r[0].transcript; }
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
   SR.onerror=()=>{};
   SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
-
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
-  if(!SR) initSR();
-  try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
+  if(!SR) initSR(); try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
   tFull=""; tLast=""; teacherOut.textContent="Listening (Teacher Mic)…";
-  keepTeacher=true; SR.start();
-  document.getElementById('micBtn').disabled=true;
-  document.getElementById('stopTeacher').disabled=false;
-  statusEl.textContent='listening (teacher)';
-  clearAfterPause('t');
+  keepTeacher=true; SR.start(); document.getElementById('micBtn').disabled=true; document.getElementById('stopTeacher').disabled=false;
+  statusEl.textContent='listening (teacher)'; clearAfterPause('t');
 }
 function stopTeacher(){
-  keepTeacher=false; try{ SR && SR.stop(); }catch{}
-  document.getElementById('micBtn').disabled=false;
-  document.getElementById('stopTeacher').disabled=true;
+  keepTeacher=false; try{ SR && SR.stop(); }catch{} document.getElementById('micBtn').disabled=false; document.getElementById('stopTeacher').disabled=true;
   if(!mediaRec) statusEl.textContent='idle';
 }
 
-/* ====== Student (tab audio → WebAudio boost → MediaRecorder → Whisper) ====== */
+/*** ------- Student (tab → boost → recorder → Whisper) ------- ***/
 async function startStudent(){
-  try{
-    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
-  }catch{
-    alert('Выбор вкладки отменён.'); return;
-  }
+  try{ displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true }); }
+  catch{ alert('Выбор вкладки отменён.'); return; }
 
   const aTracks = displayStream.getAudioTracks();
-  if(!aTracks || aTracks.length===0){
-    alert('Нет аудио! Выбери "Chrome Tab" и включи "Share tab audio".');
-    displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return;
-  }
-  const srcTrack = aTracks[0];
-  srcStream = new MediaStream([srcTrack]);
+  if(!aTracks || aTracks.length===0){ alert('Нет аудио! Включи "Share tab audio".'); displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return; }
+  const srcTrack = aTracks[0]; srcStream = new MediaStream([srcTrack]);
 
-  // WebAudio: boost
   try{
     audioCtx = new (window.AudioContext||window.webkitAudioContext)();
     const source = audioCtx.createMediaStreamSource(srcStream);
-    gainNode = audioCtx.createGain();      // усиление
-    gainNode.gain.value = 2.5;             // x2.5 — можно менять
-    analyser = audioCtx.createAnalyser();  // для RMS
-    analyser.fftSize = 512;
-
+    gainNode = audioCtx.createGain(); gainNode.gain.value = 2.5;
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 512;
     const dest = audioCtx.createMediaStreamDestination();
-
-    source.connect(gainNode);
-    gainNode.connect(analyser);
-    gainNode.connect(dest);
-
-    boostedStream = dest.stream;           // вот этот поток и пишем рекордером
-
+    source.connect(gainNode); gainNode.connect(analyser); gainNode.connect(dest);
+    boostedStream = dest.stream;
     const data = new Uint8Array(analyser.fftSize);
-    (function meter(){
-      if(!analyser) return;
-      analyser.getByteTimeDomainData(data);
+    (function meter(){ if(!analyser) return; analyser.getByteTimeDomainData(data);
       let sum=0; for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
-      rms = Math.sqrt(sum/data.length);
-      updateDiag();
-      requestAnimationFrame(meter);
+      rms = Math.sqrt(sum/data.length); updateDiag(); requestAnimationFrame(meter);
     })();
-  }catch(e){
-    // если вдруг не получилось — пишем исходный поток
-    boostedStream = srcStream;
-    updateDiag({msg:'boost disabled: '+e.message});
-  }
+  }catch(e){ boostedStream = srcStream; updateDiag({msg:'boost disabled: '+e.message}); }
 
-  // стопы треков
-  srcTrack.addEventListener('ended', () => { updateDiag({msg:'audioTrack ended'}); stopStudent(); });
   displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => { updateDiag({msg:'display video ended'}); stopStudent(); }));
 
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
   studentStopRequested=false; chunkCount=0; lastSize=0; lastChunkTs=0; mimeIdx=0;
-  aggBlobs=[]; aggMs=0; sttBusy=false; aggStart=Date.now();
+  aggBlobs=[]; aggMs=0; sttBusy=false; aggStart=Date.now(); flushCount=0; lastFlushAt='—';
 
   startRecorderWithCurrentMime();
 
-  // пульс
   clearInterval(studentPulse);
-  studentPulse = setInterval(() => {
-    try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{}
-  }, CHUNK_MS);
+  studentPulse = setInterval(() => { try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{} }, CHUNK_MS);
 
-  // сторож + флашер
-  let consecutiveRestarts=0;
+  // сторож
   clearInterval(studentWatchdog);
   studentWatchdog = setInterval(() => {
     const gap = Date.now() - (lastChunkTs||0);
     if (mediaRec && mediaRec.state==='recording' && gap > 6000) {
       updateDiag({msg:`watchdog: restart (gap=${gap}ms)`});
       try { mediaRec.stop(); } catch {}
-      consecutiveRestarts++;
-      setTimeout(() => {
-        if (Date.now() - (lastChunkTs||0) > 7000 && consecutiveRestarts>=2) {
-          mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
-          updateDiag({msg:`switch mime → ${MIME_CHAIN[mimeIdx] || 'auto'}`});
-          startRecorderWithCurrentMime(true);
-          consecutiveRestarts = 0;
-        }
-      }, 900);
-    } else {
-      consecutiveRestarts = 0;
-    }
-
-    // принудительный флаш: если тихо долго — всё равно отправим
-    if (!sttBusy && (aggMs >= AGG_MS || (Date.now()-aggStart)>=HARD_FLUSH_MS)) {
-      flushAgg(true);
     }
   }, 2000);
 
-  document.getElementById('tabBtn').disabled=true;
-  document.getElementById('stopStudent').disabled=false;
+  // независимый флаш-тикер (каждую секунду)
+  clearInterval(flushTicker);
+  flushTicker = setInterval(checkFlush, 1000);
+
+  document.getElementById('tabBtn').disabled=true; document.getElementById('stopStudent').disabled=false;
   statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
   clearAfterPause('s');
 }
@@ -306,58 +251,39 @@ function startRecorderWithCurrentMime(force=false){
   try{
     const conf = MIME_CHAIN[mimeIdx] ? { mimeType: MIME_CHAIN[mimeIdx], audioBitsPerSecond: 128000 } : { audioBitsPerSecond: 128000 };
     mediaRec = new MediaRecorder(boostedStream, conf);
-  }catch(e){
-    updateDiag({msg:`init fail for ${MIME_CHAIN[mimeIdx]}: ${e.message}`});
-    mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
-    return startRecorderWithCurrentMime(true);
-  }
-
-  mediaRec.onstart = ()=> updateDiag({msg:'recorder started'});
-  mediaRec.onerror = (e)=> updateDiag({msg:`recorder error: ${e.name||e.message}`});
-  mediaRec.onstop  = ()=>{
-    updateDiag({msg:'recorder stopped'});
-    if (!studentStopRequested && (boostedStream?.getAudioTracks?.()[0]?.readyState==='live')) {
-      setTimeout(()=> startRecorderWithCurrentMime(true), 200);
-    }
-  };
+  }catch(e){ updateDiag({msg:`init fail for ${MIME_CHAIN[mimeIdx]}: ${e.message}`}); mimeIdx=(mimeIdx+1)%MIME_CHAIN.length; return startRecorderWithCurrentMime(true); }
 
   mediaRec.ondataavailable = (ev) => {
     if(!ev.data || ev.data.size < 800){ updateDiag({msg:'tiny chunk skipped'}); return; }
     lastChunkTs = Date.now(); chunkCount++; lastSize = ev.data.size;
-
-    aggBlobs.push(ev.data);
-    aggMs += CHUNK_MS;
-    updateDiag();
+    aggBlobs.push(ev.data); aggMs += CHUNK_MS; updateDiag();
   };
+  mediaRec.onstop = ()=>{ updateDiag({msg:'recorder stopped'}); if(!studentStopRequested && boostedStream?.getAudioTracks?.()[0]?.readyState==='live'){ setTimeout(()=>startRecorderWithCurrentMime(true), 200); } };
+  mediaRec.onerror = e=> updateDiag({msg:`recorder error: ${e.name||e.message}`});
+  mediaRec.onstart = ()=> updateDiag({msg:'recorder started'});
+  try{ mediaRec.start(CHUNK_MS); }catch(e){ updateDiag({msg:`start failed: ${e.message}`}); mimeIdx=(mimeIdx+1)%MIME_CHAIN.length; startRecorderWithCurrentMime(true); }
+}
 
-  try { mediaRec.start(CHUNK_MS); }
-  catch(e){
-    updateDiag({msg:`start failed: ${e.message}`});
-    mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
-    startRecorderWithCurrentMime(true);
+// вызывается тикером каждую секунду
+function checkFlush(){
+  const hard = (Date.now()-aggStart) >= HARD_FLUSH_MS;
+  if (!sttBusy && aggBlobs.length && (aggMs >= AGG_MS || hard)) {
+    flushAgg(hard /*force*/, false /*manual*/);
   }
 }
 
-async function flushAgg(force=false){
+async function flushAgg(force=false, manual=false){
   if (!aggBlobs.length || sttBusy) return;
-
-  // мягкая VAD: если тихо и не форс — копим дальше
-  if (!force && rms < VAD_TH && aggMs < HARD_FLUSH_MS) {
-    updateDiag({msg:`VAD hold (rms=${rms.toFixed(3)})`});
-    return;
-  }
+  // мягкая VAD: если тихо и не force — подождём ещё секундочку
+  if (!force && rms < VAD_TH && aggMs < HARD_FLUSH_MS) { updateDiag({msg:`VAD hold (rms=${rms.toFixed(3)})`}); return; }
 
   const blob = new Blob(aggBlobs, { type: aggBlobs[0].type || 'audio/webm' });
-  aggBlobs=[]; aggMs=0; aggStart=Date.now();
-  sttBusy = true;
+  aggBlobs=[]; aggMs=0; aggStart=Date.now(); sttBusy = true; flushCount++; lastFlushAt=now(); updateDiag({msg:`flush → ${manual?'manual':'auto'} (${blob.size} bytes)`});
 
   try{
     const buf = await blob.arrayBuffer();
     const b64 = arrayBufferToBase64(buf);
-    const resp = await fetch('/api/stt_student', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ audioBase64: b64 })
-    });
+    const resp = await fetch('/api/stt_student', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ audioBase64: b64 }) });
     const data = await resp.json();
     const text = (data?.text || '').trim();
     if(text){
@@ -366,20 +292,17 @@ async function flushAgg(force=false){
       const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
       clearAfterPause('s');
     }
-  }catch(err){
-    updateDiag({msg:`upload/STT error: ${err.message}`});
-  }finally{
-    sttBusy = false;
-  }
+  }catch(err){ updateDiag({msg:`upload/STT error: ${err.message}`}); }
+  finally{ sttBusy = false; updateDiag(); }
 }
 
 function stopStudent(){
   studentStopRequested = true;
-  try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{}
-  mediaRec = null;
+  try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{} mediaRec = null;
 
-  clearInterval(studentPulse);      studentPulse=null;
-  clearInterval(studentWatchdog);   studentWatchdog=null;
+  clearInterval(studentPulse); studentPulse=null;
+  clearInterval(studentWatchdog); studentWatchdog=null;
+  clearInterval(flushTicker); flushTicker=null;
 
   if(boostedStream){ try{ boostedStream.getTracks().forEach(t=>t.stop()); }catch{} boostedStream=null; }
   if(srcStream){ try{ srcStream.getTracks().forEach(t=>t.stop()); }catch{} srcStream=null; }
@@ -388,81 +311,50 @@ function stopStudent(){
   if(analyser){ try{ analyser.disconnect(); }catch{} analyser=null; }
   if(gainNode){ try{ gainNode.disconnect(); }catch{} gainNode=null; }
   if(audioCtx){ try{ audioCtx.close(); }catch{} audioCtx=null; }
-  rms = 0; aggBlobs=[]; aggMs=0; sttBusy=false;
 
-  document.getElementById('tabBtn').disabled=false;
-  document.getElementById('stopStudent').disabled=true;
+  rms = 0; aggBlobs=[]; aggMs=0; sttBusy=false; flushCount=0; lastFlushAt='—';
+
+  document.getElementById('tabBtn').disabled=false; document.getElementById('stopStudent').disabled=true;
   statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
   updateDiag({msg:'student stopped'});
 }
 
-/* ====== AI hints ====== */
+/*** ------- AI hints ------- ***/
 let busy=false;
 async function requestHints(){
   if(busy) return; busy=true;
   try{
-    const r = await fetch('/api/hints', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ teacher: tFull, student: sFull })
-    });
-    const d = await r.json();
-    if(d?.card) prependCard(d.card);
+    const r = await fetch('/api/hints', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ teacher: tFull, student: sFull }) });
+    const d = await r.json(); if(d?.card) prependCard(d.card);
   }catch(e){ console.warn(e); }
   busy=false;
 }
 function prependCard(card){
-  const hasContent =
-    (card.errors && card.errors.length) ||
-    (card.definitions && card.definitions.length) ||
-    (card.synonyms && card.synonyms.length);
-  if (!hasContent) return;
-
+  const hasContent=(card.errors&&card.errors.length)||(card.definitions&&card.definitions.length)||(card.synonyms&&card.synonyms.length);
+  if(!hasContent) return;
   const div=document.createElement('div'); div.className='entry';
-  div.innerHTML=`
-    <div class="cols">
-      <div class="col error"><h4>Errors & Fix</h4><div class="errors"></div></div>
-      <div class="col def"><h4>Definitions</h4><div class="defs"></div></div>
-      <div class="col syn"><h4>Synonyms</h4><div class="syns"></div></div>
-    </div>`;
+  div.innerHTML=`<div class="cols">
+    <div class="col error"><h4>Errors & Fix</h4><div class="errors"></div></div>
+    <div class="col def"><h4>Definitions</h4><div class="defs"></div></div>
+    <div class="col syn"><h4>Synonyms</h4><div class="syns"></div></div>
+  </div>`;
   const eW=div.querySelector('.errors'), dW=div.querySelector('.defs'), sW=div.querySelector('.syns');
-
-  (card.errors||[]).forEach(e=>{
-    const el=document.createElement('div'); el.className='errItem';
-    el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`;
-    eW.appendChild(el);
-  });
-  (card.definitions||[]).forEach(x=>{
-    const el=document.createElement('div'); el.className='defItem';
-    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`;
-    dW.appendChild(el);
-  });
-  (card.synonyms||[]).forEach(x=>{
-    const el=document.createElement('div'); el.className='synItem';
-    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`;
-    sW.appendChild(el);
-  });
-
-  feed.prepend(div);
-  while(feed.children.length>30) feed.removeChild(feed.lastChild);
+  (card.errors||[]).forEach(e=>{ const el=document.createElement('div'); el.className='errItem'; el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`; eW.appendChild(el); });
+  (card.definitions||[]).forEach(x=>{ const el=document.createElement('div'); el.className='defItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`; dW.appendChild(el); });
+  (card.synonyms||[]).forEach(x=>{ const el=document.createElement('div'); el.className='synItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`; sW.appendChild(el); });
+  feed.prepend(div); while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-/* ====== Quick test ====== */
-document.getElementById('sendManual').onclick = async () => {
-  const el = document.getElementById('manualText');
-  const t = el.value.trim(); if(!t) return;
-  tFull = tFull ? (tFull + ' ' + t) : t;
-  teacherOut.textContent = tFull;
-  const tt = tail(tFull); if(tt && tt !== tLast){ tLast = tt; requestHints(); }
-  el.value = '';
-  clearAfterPause('t');
-};
+/*** ------- Quick test ------- ***/
+document.getElementById('sendManual').onclick=()=>{ const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
+  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull; const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); } el.value=''; clearAfterPause('t'); };
 
-/* ====== Bind ====== */
+/*** ------- Bind ------- ***/
 document.getElementById('micBtn').onclick = startTeacher;
 document.getElementById('stopTeacher').onclick = stopTeacher;
 document.getElementById('tabBtn').onclick = startStudent;
 document.getElementById('stopStudent').onclick = stopStudent;
+document.getElementById('forceFlush').onclick = ()=>flushAgg(true,true);
 
 updateDiag();
 </script>
