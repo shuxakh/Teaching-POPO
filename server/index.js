@@ -4,47 +4,46 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import OpenAI from "openai";
-import { toFile } from "openai/uploads"; // ✅ корректно создаёт File для Node
+import { toFile } from "openai/uploads";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// ВАЖНО: поднять лимиты тела запроса, иначе большие аудио будут рубиться (413)
+// важные лимиты тела запроса
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// Раздаём статические файлы клиентской части
+// статические файлы (клиент)
 app.use(express.static(path.join(__dirname, "..", "client")));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// =============== STT: распознавание речи студента ===============
+// ===== STT: студент =====
 app.post("/api/stt_student", async (req, res) => {
   try {
-    const { audioBase64 } = req.body || {};
-    if (!audioBase64) {
-      return res.status(400).json({ error: "no audioBase64" });
-    }
+    const { audioBase64, mime } = req.body || {};
+    if (!audioBase64) return res.status(400).json({ error: "no audioBase64" });
 
-    // base64 → Buffer
     const buf = Buffer.from(audioBase64, "base64");
 
-    // Создаём корректный File для SDK (важно для Node)
-    const file = await toFile(buf, "chunk.webm", { type: "audio/webm" });
+    // подберём корректный mime/имя файла
+    const isWav = mime === "audio/wav";
+    const filename = isWav ? "chunk.wav" : "chunk.webm";
+    const filetype = isWav ? "audio/wav" : "audio/webm";
 
-    // Быстрый и дешёвый транскрайб: gpt-4o-mini-transcribe (если недоступен — whisper-1)
+    const file = await toFile(buf, filename, { type: filetype });
+
+    // сперва пробуем быстрый транскрайб, при отсутствии — whisper-1
     let text = "";
     try {
       const r = await openai.audio.transcriptions.create({
         file,
         model: "gpt-4o-mini-transcribe",
-        // language: "en", // можно зафиксировать язык при необходимости
       });
       text = (r?.text || "").trim();
-    } catch (e) {
-      // Фолбэк на whisper-1 (если вдруг mini-transcribe недоступен)
+    } catch {
       const r2 = await openai.audio.transcriptions.create({
         file,
         model: "whisper-1",
@@ -54,14 +53,12 @@ app.post("/api/stt_student", async (req, res) => {
 
     return res.json({ text });
   } catch (err) {
-    // Вернём явную ошибку, чтобы её увидели в Diagnostics на клиенте
-    console.error("STT /api/stt_student error:", err?.response?.data || err.message);
-    const code = err?.status || 500;
-    return res.status(code).send(err?.message || "STT error");
+    console.error("STT error:", err?.response?.data || err.message);
+    return res.status(err?.status || 500).send(err?.message || "STT error");
   }
 });
 
-// =============== Подсказки/карточки для учителя ===============
+// ===== Карточки-подсказки =====
 app.post("/api/hints", async (req, res) => {
   try {
     const { teacher = "", student = "" } = req.body || {};
@@ -75,9 +72,7 @@ You are a concise English-teaching assistant. From the input text, produce a JSO
   "definitions": [{"word": "...", "pos": "noun|verb|adj", "simple_def": "..."}],
   "synonyms": [{"word": "...", "pos": "noun|verb|adj", "list": ["...","..."]}]
 }
-- Keep it short and simple.
-- Only include a few most relevant nouns/verbs/adjectives.
-- If no content for a section, return an empty array for it.
+Keep it short. Use simple English. Pick a few relevant nouns/verbs/adjectives.
 Input: """${input}"""`;
 
     const chat = await openai.chat.completions.create({
@@ -88,9 +83,7 @@ Input: """${input}"""`;
     });
 
     let payload = {};
-    try {
-      payload = JSON.parse(chat.choices?.[0]?.message?.content || "{}");
-    } catch {}
+    try { payload = JSON.parse(chat.choices?.[0]?.message?.content || "{}"); } catch {}
 
     const card = {
       errors: Array.isArray(payload.errors) ? payload.errors : [],
@@ -105,7 +98,7 @@ Input: """${input}"""`;
   }
 });
 
-// =============== SPA fallback ===============
+// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
