@@ -99,8 +99,8 @@ const MIME_CHAIN=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus',
 let mimeIdx=0;
 
 const CHUNK_MS=1000;
-const AGG_MS=4500;        // нормальный флаш
-const HARD_FLUSH_MS=7000; // максимум ожидания
+const AGG_MS=3000;        // ⬅️ буфер 3с (раньше 4.5)
+const HARD_FLUSH_MS=7000; // максимум 7с — отправим даже в тишине
 const PAUSE_MS=4000;
 
 let tPauseTimer=null, sPauseTimer=null;
@@ -139,7 +139,7 @@ function updateDiag(extra={}){
   const recState = mediaRec?.state || '—';
   const aState = aTrack?.readyState || '—';
   const vState = vTrack?.readyState || '—';
-  diagEl.firstChild && (diagEl.firstChild.textContent = ''); // чистим "idle"
+  diagEl.firstChild && (diagEl.firstChild.textContent = '');
   diagEl.innerHTML = `
 time: ${now()}<br>
 recorder: <span class="${recState==='recording'?'ok':'warn'}">${recState}</span>
@@ -158,11 +158,10 @@ video track: ${vState}<br>
 ${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
 <button id="forceFlush" class="ghost">Force flush</button>
 `.trim();
-  // заново повесим кнопку (innerHTML пересоздал её)
   const ff=document.getElementById('forceFlush'); if(ff) ff.onclick=()=>flushAgg(true,true);
 }
 
-/*** ------- Teacher (SpeechRecognition) ------- ***/
+/*** ------- Teacher (SR) ------- ***/
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
   SR=new S(); SR.lang='en-US'; SR.interimResults=true; SR.continuous=true;
@@ -176,8 +175,7 @@ function initSR(){
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
-  SR.onerror=()=>{};
-  SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
+  SR.onerror=()=>{}; SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
@@ -226,7 +224,6 @@ async function startStudent(){
   clearInterval(studentPulse);
   studentPulse = setInterval(() => { try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{} }, CHUNK_MS);
 
-  // сторож
   clearInterval(studentWatchdog);
   studentWatchdog = setInterval(() => {
     const gap = Date.now() - (lastChunkTs||0);
@@ -236,7 +233,6 @@ async function startStudent(){
     }
   }, 2000);
 
-  // независимый флаш-тикер (каждую секунду)
   clearInterval(flushTicker);
   flushTicker = setInterval(checkFlush, 1000);
 
@@ -264,7 +260,6 @@ function startRecorderWithCurrentMime(force=false){
   try{ mediaRec.start(CHUNK_MS); }catch(e){ updateDiag({msg:`start failed: ${e.message}`}); mimeIdx=(mimeIdx+1)%MIME_CHAIN.length; startRecorderWithCurrentMime(true); }
 }
 
-// вызывается тикером каждую секунду
 function checkFlush(){
   const hard = (Date.now()-aggStart) >= HARD_FLUSH_MS;
   if (!sttBusy && aggBlobs.length && (aggMs >= AGG_MS || hard)) {
@@ -274,26 +269,53 @@ function checkFlush(){
 
 async function flushAgg(force=false, manual=false){
   if (!aggBlobs.length || sttBusy) return;
-  // мягкая VAD: если тихо и не force — подождём ещё секундочку
-  if (!force && rms < VAD_TH && aggMs < HARD_FLUSH_MS) { updateDiag({msg:`VAD hold (rms=${rms.toFixed(3)})`}); return; }
 
-  const blob = new Blob(aggBlobs, { type: aggBlobs[0].type || 'audio/webm' });
-  aggBlobs=[]; aggMs=0; aggStart=Date.now(); sttBusy = true; flushCount++; lastFlushAt=now(); updateDiag({msg:`flush → ${manual?'manual':'auto'} (${blob.size} bytes)`});
+  if (!force && rms < VAD_TH && aggMs < HARD_FLUSH_MS) {
+    updateDiag({msg:`VAD hold (rms=${rms.toFixed(3)})`});
+    return;
+  }
+
+  let blob = new Blob(aggBlobs, { type: aggBlobs[0].type || 'audio/webm' });
+  // ограничим размер тела в ~4 МБ (на всякий случай)
+  const MAX = 4 * 1024 * 1024;
+  if (blob.size > MAX) blob = blob.slice(blob.size - MAX);
+
+  aggBlobs=[]; aggMs=0; aggStart=Date.now();
+  sttBusy = true; flushCount++; lastFlushAt=now();
+  updateDiag({msg:`flush → ${manual?'manual':'auto'} (${blob.size} bytes)`});
 
   try{
     const buf = await blob.arrayBuffer();
     const b64 = arrayBufferToBase64(buf);
-    const resp = await fetch('/api/stt_student', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ audioBase64: b64 }) });
-    const data = await resp.json();
+
+    const resp = await fetch('/api/stt_student', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ audioBase64: b64 })
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text().catch(()=> '');
+      updateDiag({msg:`/api/stt_student ${resp.status} ${resp.statusText} ${txt.slice(0,200)}`});
+      return;
+    }
+
+    const data = await resp.json().catch(()=> ({}));
     const text = (data?.text || '').trim();
     if(text){
       sFull += (sFull ? ' ' : '') + text;
       studentOut.textContent = sFull;
       const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
       clearAfterPause('s');
+    } else {
+      updateDiag({msg:'STT ok, but empty text'});
     }
-  }catch(err){ updateDiag({msg:`upload/STT error: ${err.message}`}); }
-  finally{ sttBusy = false; updateDiag(); }
+  } catch(err){
+    updateDiag({msg:`upload/STT error: ${err.message}`});
+  } finally {
+    sttBusy = false;
+    updateDiag();
+  }
 }
 
 function stopStudent(){
