@@ -17,7 +17,7 @@ app.use(express.static(path.join(__dirname, "..", "client")));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// STT для студента (WAV/PCM, язык фиксируем EN)
+// -------- STT (student) ----------
 app.post("/api/stt_student", async (req, res) => {
   try {
     const { audioBase64, mime } = req.body || {};
@@ -53,7 +53,7 @@ app.post("/api/stt_student", async (req, res) => {
   }
 });
 
-// Генерация подсказок (3 колонки)
+// -------- Hints (3 колонки) ----------
 app.post("/api/hints", async (req, res) => {
   try {
     const { teacher = "", student = "" } = req.body || {};
@@ -91,7 +91,7 @@ Input: """${input}"""`;
   }
 });
 
-// single-page
+// SPA
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
