@@ -84,11 +84,12 @@
 <script>
 /* ====== state & helpers ====== */
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
-let tabStream=null, mediaRec=null;
-const CHUNK_MS=1500;
-const PAUSE_MS=4000;   // авто-очистка после паузы
+let displayStream=null, audioStream=null, mediaRec=null;
+const CHUNK_MS=1000;     // чаще — стабильнее поток
+const PAUSE_MS=4000;     // авто-очистка после паузы
 let tPauseTimer=null, sPauseTimer=null;
 let studentPulse=null, studentWatchdog=null, lastChunkTs=0;
+let studentStopRequested=false;
 
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
@@ -161,28 +162,77 @@ function stopTeacher(){
 
 /* ====== Student (tab audio → Whisper) ====== */
 async function startStudent(){
-  // 1) поток с вкладки
-  let display;
-  try{ display = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true }); }
-  catch{ alert('Выбор вкладки отменён.'); return; }
-
-  // 2) только аудио-трек
-  const aTracks=display.getAudioTracks();
-  if(!aTracks || aTracks.length===0){
-    alert('Нет аудио! Выбери "Chrome Tab" и включи "Share tab audio".');
-    display.getTracks().forEach(t=>t.stop());
+  // 1) запрос шаринга вкладки
+  try{
+    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+  }catch{
+    alert('Выбор вкладки отменён.');
     return;
   }
-  const audioStream = new MediaStream([aTracks[0]]);
-  display.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => stopStudent()));
+
+  // 2) берём только аудио-трек
+  const aTracks = displayStream.getAudioTracks();
+  if(!aTracks || aTracks.length===0){
+    alert('Нет аудио! Выбери "Chrome Tab" и включи "Share tab audio".');
+    displayStream.getTracks().forEach(t=>t.stop()); displayStream=null;
+    return;
+  }
+  const audioTrack = aTracks[0];
+  audioStream = new MediaStream([audioTrack]);
+
+  // события трека
+  audioTrack.addEventListener('ended', () => stopStudent());
+  audioTrack.addEventListener('mute',  () => console.log('student: mute'));
+  audioTrack.addEventListener('unmute',()=> console.log('student: unmute'));
+
+  // если пользователь остановит шаринг видео — тоже стоп
+  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => stopStudent()));
 
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
-  const mime=pickMime();
-  try{ mediaRec=new MediaRecorder(audioStream, mime?{mimeType:mime}:{}) }
-  catch(e){ console.warn('Recorder init fail',e); alert('Не удалось инициализировать запись аудио вкладки.'); display.getTracks().forEach(t=>t.stop()); return; }
+  studentStopRequested=false;
+
+  // 3) запускаем рекордер (и перезапускатель)
+  setupStudentRecorder(); // создаёт mediaRec и запускает .start()
+
+  // регулярный «пульс» + watchdog
+  lastChunkTs = Date.now();
+  clearInterval(studentPulse);
+  studentPulse = setInterval(() => {
+    try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{}
+  }, CHUNK_MS);
+
+  clearInterval(studentWatchdog);
+  studentWatchdog = setInterval(() => {
+    if (!audioTrack || audioTrack.readyState !== 'live') return;
+    const gap = Date.now() - lastChunkTs;
+    if (gap > 6000) {               // 6с без кусочков → мягкий рестарт
+      console.log('watchdog: restart mediaRec');
+      try { mediaRec && mediaRec.stop(); } catch {}
+      // onstop перезапустит
+    }
+  }, 2000);
+
+  document.getElementById('tabBtn').disabled=true;
+  document.getElementById('stopStudent').disabled=false;
+  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
+  clearAfterPause('s');
+}
+
+/* создаёт/перезапускает MediaRecorder поверх audioStream */
+function setupStudentRecorder(){
+  if (!audioStream) return;
+  const mime = pickMime();
+  try{
+    mediaRec = new MediaRecorder(audioStream, mime ? { mimeType: mime } : {});
+  }catch(e){
+    console.warn('Recorder init fail', e);
+    alert('Не удалось инициализировать запись аудио вкладки.');
+    stopStudent();
+    return;
+  }
 
   mediaRec.ondataavailable = async (ev) => {
-    if(!ev.data || ev.data.size < 1000) return;
+    if(!ev.data || ev.data.size < 800) return;
     lastChunkTs = Date.now();
     try{
       const buf = await ev.data.arrayBuffer();
@@ -203,36 +253,37 @@ async function startStudent(){
     }catch(err){ console.warn('STT error', err); }
   };
 
-  mediaRec.onerror=(e)=>console.warn('MediaRecorder error',e);
-
-  try{ mediaRec.start(CHUNK_MS); }catch(e){
-    console.warn('start failed',e); alert('Не удалось начать запись. Включи "Share tab audio" и попробуй снова.');
-    display.getTracks().forEach(t=>t.stop()); return;
-  }
-
-  // пульс и watchdog
-  lastChunkTs = Date.now();
-  studentPulse = setInterval(()=>{ try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{} }, CHUNK_MS);
-  studentWatchdog = setInterval(()=>{
-    if(Date.now() - lastChunkTs > 6000){ // 6с тишины — перезапуск
-      try{ mediaRec && mediaRec.stop(); }catch{}
-      try{ mediaRec.start(CHUNK_MS); lastChunkTs = Date.now(); }catch(e){ console.warn('watchdog restart fail', e); }
+  mediaRec.onstop = () => {
+    // если стоп был не по нашей кнопке — перезапустим
+    if (!studentStopRequested && audioStream && audioStream.getAudioTracks()[0]?.readyState === 'live') {
+      setTimeout(() => {
+        console.log('mediaRec auto-restart');
+        try { setupStudentRecorder(); } catch {}
+      }, 200);
     }
-  }, 2000);
+  };
 
-  tabStream = display;
-  document.getElementById('tabBtn').disabled=true;
-  document.getElementById('stopStudent').disabled=false;
-  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
-  clearAfterPause('s');
+  mediaRec.onerror = (e) => console.warn('MediaRecorder error', e);
+
+  try { mediaRec.start(CHUNK_MS); }
+  catch(e){
+    console.warn('mediaRec.start failed', e);
+    alert('Не удалось начать запись. Включи "Share tab audio" и попробуй снова.');
+    stopStudent();
+  }
 }
 
 function stopStudent(){
+  studentStopRequested = true;
   try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{}
   mediaRec = null;
-  clearInterval(studentPulse); studentPulse=null;
-  clearInterval(studentWatchdog); studentWatchdog=null;
-  if(tabStream){ try{ tabStream.getTracks().forEach(t=>t.stop()); }catch{} tabStream=null; }
+
+  clearInterval(studentPulse);      studentPulse=null;
+  clearInterval(studentWatchdog);   studentWatchdog=null;
+
+  if(audioStream){ try{ audioStream.getTracks().forEach(t=>t.stop()); }catch{} audioStream=null; }
+  if(displayStream){ try{ displayStream.getTracks().forEach(t=>t.stop()); }catch{} displayStream=null; }
+
   document.getElementById('tabBtn').disabled=false;
   document.getElementById('stopStudent').disabled=true;
   statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
@@ -249,13 +300,12 @@ async function requestHints(){
       body: JSON.stringify({ teacher: tFull, student: sFull })
     });
     const d = await r.json();
-    if(d?.card) prependCard(d.card); // сервер уже фильтрует пустые
+    if(d?.card) prependCard(d.card);
   }catch(e){ console.warn(e); }
   busy=false;
 }
 
 function prependCard(card){
-  // локальная проверка на случай «вдруг»
   const hasContent =
     (card.errors && card.errors.length) ||
     (card.definitions && card.definitions.length) ||
