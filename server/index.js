@@ -8,12 +8,11 @@ import { OpenAI } from 'openai';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '25mb' })); // принимаем крупные аудиокуски base64
+app.use(express.json({ limit: '25mb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const PORT = process.env.PORT || 8080;
 
-// ---- helpers ----
 function lastTail(text, maxWords = 15) {
   const words = (text || '').trim().split(/\s+/);
   return words.slice(-maxWords).join(' ');
@@ -21,10 +20,7 @@ function lastTail(text, maxWords = 15) {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-/**
- * /api/hints — общие подсказки по КОРОТКОМУ хвосту объединённой речи
- * body: { teacher: "text", student: "text" }
- */
+// === LLM подсказки ===
 app.post('/api/hints', async (req, res) => {
   try {
     const teacher = (req.body?.teacher || '').trim();
@@ -38,39 +34,28 @@ app.post('/api/hints', async (req, res) => {
 You are an assistant for an English teacher. Analyze ONLY this short tail:
 "${focus}"
 
-Return STRICT JSON with three arrays (always present):
+Return STRICT JSON:
 {
   "errors": [
-    {
-      "title": "Missing article | Grammar mistake | etc.",
-      "wrong": "short incorrect fragment",
-      "fix": "corrected fragment",
-      "explanation": "A2-level reason (<=300 chars)"
-    }
+    {"title":"...","wrong":"...","fix":"...","explanation":"..."}
   ],
   "definitions": [
-    { "word": "word", "pos": "noun|verb|adj", "simple_def": "Very simple (A1-A2)" }
+    {"word":"...","pos":"noun|verb|adj","simple_def":"..."}
   ],
   "synonyms": [
-    { "word": "word", "pos": "noun|verb|adj", "list": ["syn1","syn2","syn3"] }
+    {"word":"...","pos":"noun|verb|adj","list":["...","..."]}
   ]
-}
-
-Rules:
-- errors: 0–2 items;
-- definitions: 1–3 items from the utterance;
-- synonyms: 1–3 items, 2–5 synonyms each (reuse from definitions if needed).
-- ONLY JSON. No markdown/prose.
-`;
+}`;
 
     let card = { errors: [], definitions: [], synonyms: [] };
+
     try {
       const resp = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.1,
         max_tokens: 260,
         messages: [
-          { role: 'system', content: 'Return ONLY valid JSON. No markdown. No commentary.' },
+          { role: 'system', content: 'Return ONLY valid JSON. No markdown.' },
           { role: 'user', content: prompt }
         ]
       });
@@ -80,7 +65,7 @@ Rules:
       card.definitions = Array.isArray(parsed.definitions) ? parsed.definitions : [];
       card.synonyms = Array.isArray(parsed.synonyms) ? parsed.synonyms : [];
     } catch (e) {
-      console.error('LLM error', e?.message);
+      console.error('LLM error:', e.message);
     }
 
     res.json({ card, focus });
@@ -90,48 +75,37 @@ Rules:
   }
 });
 
-/**
- * /api/stt_student — серверное STT для ЗВУКА УЧЕНИКА (захват вкладки)
- * body: { audioBase64: "data in base64 (no prefix)", mime: "audio/webm" }
- * Возвращает: { text: "..." }
- */
+// === Whisper STT для ученика ===
 app.post('/api/stt_student', async (req, res) => {
   try {
-    const { audioBase64, mime } = req.body || {};
+    const { audioBase64 } = req.body || {};
     if (!audioBase64) return res.status(400).json({ text: '' });
 
-    // сохраняем chunk во временный файл и даём его Whisper'у
     const buf = Buffer.from(audioBase64, 'base64');
-    const tmpName = `${randomUUID()}.webm`;
-    const tmpPath = path.join('/tmp', tmpName);
-    fs.writeFileSync(tmpPath, buf);
+    const tmp = path.join('/tmp', `${randomUUID()}.webm`);
+    fs.writeFileSync(tmp, buf);
 
     let text = '';
     try {
-      const fileStream = fs.createReadStream(tmpPath);
-      const resp = await openai.audio.transcriptions.create({
-        file: fileStream,
-        model: 'whisper-1', // серверное STT
-        // language можно не задавать — автоопределение. При желании: language: 'en'
+      const f = fs.createReadStream(tmp);
+      const tr = await openai.audio.transcriptions.create({
+        file: f,
+        model: 'whisper-1'
       });
-      text = (resp?.text || '').trim();
+      text = (tr?.text || '').trim();
     } catch (e) {
-      console.error('Whisper error:', e?.message);
+      console.error('Whisper error:', e.message);
     } finally {
-      try { fs.unlinkSync(tmpPath); } catch {}
+      try { fs.unlinkSync(tmp); } catch {}
     }
 
     res.json({ text });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ text: '' });
   }
 });
 
-// статика и редирект
 app.use(express.static('client'));
 app.get('/', (_req, res) => res.redirect('/teacher.html'));
-
-app.listen(PORT, () => {
-  console.log(`Teacher-only AI Tutor running: http://localhost:${PORT}/teacher.html`);
-});
+app.listen(PORT, () => console.log(`Ready → http://localhost:${PORT}/teacher.html`));
