@@ -29,6 +29,12 @@
     .defItem{background:#f5f0ff;border:1px solid #c9b6ff}
     .synItem{background:#f0fff0;border:1px solid #b8e6b8}
     .note{color:#666;font-size:.9rem}
+    /* Диагностика */
+    .diag{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          background:#0b1020;color:#d9e1ff;border-radius:12px;border:1px solid #263056;
+          padding:12px;line-height:1.35;overflow:auto}
+    .ok{color:#9cff9c} .bad{color:#ff9c9c} .warn{color:#ffd27a}
+    .chip{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #445}
   </style>
 </head>
 <body>
@@ -78,23 +84,35 @@
   <h3 style="margin-top:16px">AI hints (newest on top)</h3>
   <div id="feed" class="feed"></div>
 
-  <p class="note">Status: <span id="status">idle</span></p>
+  <h3 style="margin-top:16px">Diagnostics</h3>
+  <div id="diag" class="diag">idle</div>
+
+  <p class="note" style="margin-top:8px">Status: <span id="status">idle</span></p>
 </div>
 
 <script>
 /* ====== state & helpers ====== */
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let displayStream=null, audioStream=null, mediaRec=null;
+const MIME_CHAIN=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4',''];
+let mimeIdx=0;
+
 const CHUNK_MS=1000;     // чаще — стабильнее поток
 const PAUSE_MS=4000;     // авто-очистка после паузы
 let tPauseTimer=null, sPauseTimer=null;
-let studentPulse=null, studentWatchdog=null, lastChunkTs=0;
+
+// пульс / сторож
+let studentPulse=null, studentWatchdog=null, lastChunkTs=0, chunkCount=0, lastSize=0;
 let studentStopRequested=false;
+
+// простая акустическая проверка (RMS) — видим «тишину»/«звук»
+let audioCtx=null, analyser=null, rms=0;
 
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
 const studentOut=document.getElementById('studentOut');
 const feed=document.getElementById('feed');
+const diagEl=document.getElementById('diag');
 
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
 function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
@@ -107,15 +125,37 @@ function clearAfterPause(which){
     sPauseTimer=setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS);
   }
 }
-function pickMime(){
-  const cand=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'];
-  for(const m of cand){ if(MediaRecorder.isTypeSupported?.(m)) return m; }
-  return '';
-}
 function arrayBufferToBase64(buffer){
   let binary=''; const bytes=new Uint8Array(buffer);
   for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]);
   return btoa(binary);
+}
+function now(){return new Date().toLocaleTimeString();}
+
+function updateDiag(extra={}){
+  const aTrack = audioStream?.getAudioTracks?.()[0];
+  const vTrack = displayStream?.getVideoTracks?.()[0];
+  const age = lastChunkTs? ((Date.now()-lastChunkTs)/1000).toFixed(1)+'s' : '—';
+  const level = rms ? rms.toFixed(3) : '0.000';
+  const mime = mediaRec?.mimeType || MIME_CHAIN[mimeIdx] || 'auto';
+  const recState = mediaRec?.state || '—';
+  const aState = aTrack?.readyState || '—';
+  const vState = vTrack?.readyState || '—';
+
+  diagEl.innerHTML = `
+time: ${now()}<br>
+recorder: <span class="${recState==='recording'?'ok':'warn'}">${recState}</span>
+  • mime: <span class="chip">${mime}</span>
+  • chunks: ${chunkCount}
+  • lastSize: ${lastSize} bytes
+  • lastChunkAge: ${age}<br>
+audio track: <span class="${aState==='live'?'ok':'bad'}">${aState}</span>
+  • muted: ${aTrack?.muted??'—'}
+  • enabled: ${aTrack?.enabled??'—'}
+  • level(RMS): ${level}<br>
+video track: ${vState}<br>
+${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
+`.trim();
 }
 
 /* ====== Teacher (SpeechRecognition) ====== */
@@ -162,7 +202,6 @@ function stopTeacher(){
 
 /* ====== Student (tab audio → Whisper) ====== */
 async function startStudent(){
-  // 1) запрос шаринга вкладки
   try{
     displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
   }catch{
@@ -170,7 +209,6 @@ async function startStudent(){
     return;
   }
 
-  // 2) берём только аудио-трек
   const aTracks = displayStream.getAudioTracks();
   if(!aTracks || aTracks.length===0){
     alert('Нет аудио! Выбери "Chrome Tab" и включи "Share tab audio".');
@@ -180,35 +218,65 @@ async function startStudent(){
   const audioTrack = aTracks[0];
   audioStream = new MediaStream([audioTrack]);
 
-  // события трека
-  audioTrack.addEventListener('ended', () => stopStudent());
-  audioTrack.addEventListener('mute',  () => console.log('student: mute'));
-  audioTrack.addEventListener('unmute',()=> console.log('student: unmute'));
+  // мониторинг треков
+  audioTrack.addEventListener('ended', () => { updateDiag({msg:'audioTrack ended'}); stopStudent(); });
+  audioTrack.addEventListener('mute',  () => updateDiag({msg:'audioTrack muted'}));
+  audioTrack.addEventListener('unmute',()=> updateDiag({msg:'audioTrack unmuted'}));
+  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => { updateDiag({msg:'display video ended'}); stopStudent(); }));
 
-  // если пользователь остановит шаринг видео — тоже стоп
-  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => stopStudent()));
+  // WebAudio RMS (не влияет на запись, только диагностика уровня)
+  try{
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(audioStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    (function meter(){
+      if(!analyser){ return; }
+      analyser.getByteTimeDomainData(data);
+      // RMS
+      let sum=0;
+      for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+      rms = Math.sqrt(sum/data.length);
+      updateDiag();
+      requestAnimationFrame(meter);
+    })();
+  }catch{ /* игнор */ }
 
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
-  studentStopRequested=false;
+  studentStopRequested=false; chunkCount=0; lastSize=0; lastChunkTs=0; mimeIdx=0;
 
-  // 3) запускаем рекордер (и перезапускатель)
-  setupStudentRecorder(); // создаёт mediaRec и запускает .start()
+  startRecorderWithCurrentMime();
 
-  // регулярный «пульс» + watchdog
-  lastChunkTs = Date.now();
+  // пульс — просим данные чаще, чтобы не засыпал
   clearInterval(studentPulse);
   studentPulse = setInterval(() => {
     try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{}
   }, CHUNK_MS);
 
+  // сторож: если 6с нет чанков → мягкий рестарт; если 2 подряд рестарта не помогли → смена mime
+  let consecutiveRestarts=0;
   clearInterval(studentWatchdog);
   studentWatchdog = setInterval(() => {
-    if (!audioTrack || audioTrack.readyState !== 'live') return;
-    const gap = Date.now() - lastChunkTs;
-    if (gap > 6000) {               // 6с без кусочков → мягкий рестарт
-      console.log('watchdog: restart mediaRec');
-      try { mediaRec && mediaRec.stop(); } catch {}
-      // onstop перезапустит
+    const gap = Date.now() - (lastChunkTs||0);
+    if (!mediaRec || mediaRec.state!=='recording') return;
+    if (gap > 6000) {
+      updateDiag({msg:`watchdog: restarting recorder (gap=${gap}ms)`});
+      try { mediaRec.stop(); } catch {}
+      consecutiveRestarts++;
+      // через 900мс onstop поднимет заново с тем же mime
+      setTimeout(() => {
+        if (Date.now() - (lastChunkTs||0) > 7000 && consecutiveRestarts>=2) {
+          // меняем mime
+          mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
+          updateDiag({msg:`switch mime → ${MIME_CHAIN[mimeIdx] || 'auto'}`});
+          startRecorderWithCurrentMime(true);
+          consecutiveRestarts = 0;
+        }
+      }, 900);
+    } else {
+      consecutiveRestarts = 0;
     }
   }, 2000);
 
@@ -218,22 +286,34 @@ async function startStudent(){
   clearAfterPause('s');
 }
 
-/* создаёт/перезапускает MediaRecorder поверх audioStream */
-function setupStudentRecorder(){
+function startRecorderWithCurrentMime(force=false){
   if (!audioStream) return;
-  const mime = pickMime();
+  if (mediaRec && !force) { try{ mediaRec.start(CHUNK_MS); }catch{} return; }
   try{
-    mediaRec = new MediaRecorder(audioStream, mime ? { mimeType: mime } : {});
+    const conf = MIME_CHAIN[mimeIdx] ? { mimeType: MIME_CHAIN[mimeIdx], audioBitsPerSecond: 128000 } : { audioBitsPerSecond: 128000 };
+    mediaRec = new MediaRecorder(audioStream, conf);
   }catch(e){
-    console.warn('Recorder init fail', e);
-    alert('Не удалось инициализировать запись аудио вкладки.');
-    stopStudent();
-    return;
+    updateDiag({msg:`init fail for ${MIME_CHAIN[mimeIdx]}: ${e.message}`});
+    // пробуем следующий mime
+    mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
+    return startRecorderWithCurrentMime(true);
   }
 
+  mediaRec.onstart = ()=> updateDiag({msg:'recorder started'});
+  mediaRec.onpause = ()=> updateDiag({msg:'recorder paused'});
+  mediaRec.onresume= ()=> updateDiag({msg:'recorder resumed'});
+  mediaRec.onerror = (e)=> updateDiag({msg:`recorder error: ${e.name||e.message}`});
+  mediaRec.onstop  = ()=>{
+    updateDiag({msg:'recorder stopped'});
+    if (!studentStopRequested && audioStream?.getAudioTracks?.()[0]?.readyState==='live') {
+      // автоподъём после stop()
+      setTimeout(()=> startRecorderWithCurrentMime(true), 200);
+    }
+  };
+
   mediaRec.ondataavailable = async (ev) => {
-    if(!ev.data || ev.data.size < 800) return;
-    lastChunkTs = Date.now();
+    if(!ev.data || ev.data.size < 800){ updateDiag({msg:'tiny chunk skipped'}); return; }
+    lastChunkTs = Date.now(); chunkCount++; lastSize = ev.data.size; updateDiag();
     try{
       const buf = await ev.data.arrayBuffer();
       const b64 = arrayBufferToBase64(buf);
@@ -250,26 +330,14 @@ function setupStudentRecorder(){
         const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
         clearAfterPause('s');
       }
-    }catch(err){ console.warn('STT error', err); }
+    }catch(err){ updateDiag({msg:`upload/STT error: ${err.message}`}); }
   };
-
-  mediaRec.onstop = () => {
-    // если стоп был не по нашей кнопке — перезапустим
-    if (!studentStopRequested && audioStream && audioStream.getAudioTracks()[0]?.readyState === 'live') {
-      setTimeout(() => {
-        console.log('mediaRec auto-restart');
-        try { setupStudentRecorder(); } catch {}
-      }, 200);
-    }
-  };
-
-  mediaRec.onerror = (e) => console.warn('MediaRecorder error', e);
 
   try { mediaRec.start(CHUNK_MS); }
   catch(e){
-    console.warn('mediaRec.start failed', e);
-    alert('Не удалось начать запись. Включи "Share tab audio" и попробуй снова.');
-    stopStudent();
+    updateDiag({msg:`start failed: ${e.message}`});
+    mimeIdx = (mimeIdx + 1) % MIME_CHAIN.length;
+    startRecorderWithCurrentMime(true);
   }
 }
 
@@ -284,9 +352,14 @@ function stopStudent(){
   if(audioStream){ try{ audioStream.getTracks().forEach(t=>t.stop()); }catch{} audioStream=null; }
   if(displayStream){ try{ displayStream.getTracks().forEach(t=>t.stop()); }catch{} displayStream=null; }
 
+  if(analyser){ try{ analyser.disconnect(); }catch{} analyser=null; }
+  if(audioCtx){ try{ audioCtx.close(); }catch{} audioCtx=null; }
+  rms = 0;
+
   document.getElementById('tabBtn').disabled=false;
   document.getElementById('stopStudent').disabled=true;
   statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
+  updateDiag({msg:'student stopped'});
 }
 
 /* ====== AI Hints (с защитой от пустых) ====== */
@@ -357,6 +430,9 @@ document.getElementById('micBtn').onclick = startTeacher;
 document.getElementById('stopTeacher').onclick = stopTeacher;
 document.getElementById('tabBtn').onclick = startStudent;
 document.getElementById('stopStudent').onclick = stopStudent;
+
+// первичный вывод диагностики
+updateDiag();
 </script>
 </body>
 </html>
