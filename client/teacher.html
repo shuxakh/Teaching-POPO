@@ -91,11 +91,17 @@
 </div>
 
 <script>
-/*** ------------ общее состояние ------------ ***/
+/*** ------- Общие переменные ------- ***/
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let displayStream=null, srcStream=null;
-let audioCtx=null, sourceNode=null, splitter=null, merger=null, gainNode=null, scriptNode=null, analyser=null;
+let audioCtx=null, sourceNode=null, gainNode=null, analyser=null, scriptNode=null;
 let sampleRate=48000;
+
+const SEND_MS=2000, PAUSE_MS=4000;
+let sPauseTimer=null, tPauseTimer=null;
+
+let pcmBuffers=[], pcmLen=0;
+let sendTimer=null, sttBusy=false, flushes=0, lastFlushAt='—', rms=0, procCalls=0;
 
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
@@ -103,31 +109,19 @@ const studentOut=document.getElementById('studentOut');
 const feed=document.getElementById('feed');
 const diagEl=document.getElementById('diag');
 
-const SEND_MS = 2000;           // каждые 2с отправляем WAV-фрагмент
-const PAUSE_MS = 4000;          // очистка live transcript после паузы
-let sPauseTimer=null;
-
-// накопитель PCM
-let pcmBuffers=[]; // массив Float32Arrays
-let pcmLen=0;
-let sendTimer=null;
-let sttBusy=false;
-let flushes=0, lastFlushAt='—', rms=0;
-
-function now(){ return new Date().toLocaleTimeString(); }
+function now(){return new Date().toLocaleTimeString();}
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
-function updateDiag(extra={}) {
+function updateDiag(extra={}){
   diagEl.innerHTML = `
 time: ${now()}<br>
-mode: WAV/PCM  • sampleRate: ${sampleRate} • flushes: ${flushes} • sttBusy: ${sttBusy} • lastFlushAt: ${lastFlushAt}<br>
-pcmLen(samples): ${pcmLen} • level(RMS): ${rms.toFixed(3)} • boost: x${(gainNode?.gain?.value||1).toFixed(1)}<br>
+mode: WAV/PCM • sampleRate: ${sampleRate} • flushes: ${flushes} • sttBusy: ${sttBusy} • lastFlushAt: ${lastFlushAt}<br>
+pcmLen(samples): ${pcmLen} • onaudioprocess calls: ${procCalls} • level(RMS): ${rms.toFixed(3)} • boost: x${(gainNode?.gain?.value||1).toFixed(1)}<br>
 ${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
-<button id="forceFlush" class="ghost">Force flush</button>
-`;
-  document.getElementById('forceFlush').onclick = () => flushWav(true);
+<button id="forceFlush" class="ghost">Force flush</button>`;
+  document.getElementById('forceFlush').onclick=()=>flushWav(true);
 }
 
-/*** ------------ Teacher (SpeechRecognition) ------------ ***/
+/*** ------- Teacher SR ------- ***/
 function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -138,13 +132,12 @@ function initSR(){
         tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
         const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
         clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
-      }else{ interim+=r[0].transcript; }
+      } else { interim+=r[0].transcript; }
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
   SR.onerror=()=>{}; SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
-let tPauseTimer=null;
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
   if(!SR) initSR(); try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
@@ -153,204 +146,137 @@ async function startTeacher(){
   statusEl.textContent='listening (teacher)';
 }
 function stopTeacher(){
-  keepTeacher=false; try{ SR && SR.stop(); }catch{} document.getElementById('micBtn').disabled=false; document.getElementById('stopTeacher').disabled=true;
+  keepTeacher=false; try{ SR && SR.stop(); }catch{}
+  document.getElementById('micBtn').disabled=false; document.getElementById('stopTeacher').disabled=true;
   if(!sendTimer) statusEl.textContent='idle';
 }
 
-/*** ------------ Student: захват вкладки → моно → WAV ------------ ***/
-function floatTo16BitPCM(input) {
-  const output = new Int16Array(input.length);
-  for (let i=0;i<input.length;i++) {
-    let s = Math.max(-1, Math.min(1, input[i]));
-    output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-  }
-  return output;
+/*** ------- WAV помощники ------- **/
+function floatTo16BitPCM(input){ const out=new Int16Array(input.length); for(let i=0;i<input.length;i++){ let s=Math.max(-1,Math.min(1,input[i])); out[i]=s<0?s*0x8000:s*0x7FFF; } return out; }
+function encodeWAV(samples,sr){
+  const buffer=new ArrayBuffer(44+samples.length*2);
+  const view=new DataView(buffer);
+  function ws(o,s){ for(let i=0;i<s.length;i++) view.setUint8(o+i,s.charCodeAt(i)); }
+  ws(0,'RIFF'); view.setUint32(4,36+samples.length*2,true);
+  ws(8,'WAVE'); ws(12,'fmt '); view.setUint32(16,16,true);
+  view.setUint16(20,1,true); view.setUint16(22,1,true); view.setUint32(24,sr,true);
+  view.setUint32(28,sr*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true);
+  ws(36,'data'); view.setUint32(40,samples.length*2,true);
+  new Int16Array(buffer,44).set(floatTo16BitPCM(samples));
+  return new Blob([buffer],{type:'audio/wav'});
 }
+function mergeFloat32(bufs,total){ const r=new Float32Array(total); let o=0; for(const b of bufs){ r.set(b,o); o+=b.length; } return r; }
 
-function encodeWAV(samples, sampleRate) {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-
-  function writeString(offset, string) { for (let i=0;i<string.length;i++) view.setUint8(offset+i, string.charCodeAt(i)); }
-
-  // RIFF header
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);        // PCM
-  view.setUint16(20, 1, true);         // PCM
-  view.setUint16(22, 1, true);         // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); // byte rate
-  view.setUint16(32, 2, true);         // block align
-  view.setUint16(34, 16, true);        // bits per sample
-  writeString(36, 'data');
-  view.setUint32(40, samples.length * 2, true);
-
-  const pcm16 = floatTo16BitPCM(samples);
-  new Int16Array(buffer, 44).set(pcm16);
-  return new Blob([buffer], { type: 'audio/wav' });
-}
-
-function mergeFloat32(buffers, totalLength) {
-  const result = new Float32Array(totalLength);
-  let offset = 0;
-  for (const b of buffers) { result.set(b, offset); offset += b.length; }
-  return result;
-}
-
-function startPCMCollector() {
-  // каждые 2 секунды — собрать текущий буфер, в WAV и отправить
-  clearInterval(sendTimer);
-  sendTimer = setInterval(() => flushWav(false), SEND_MS);
-}
-
-async function flushWav(manual=false) {
-  if (sttBusy || pcmLen === 0) return;
-  const samples = mergeFloat32(pcmBuffers, pcmLen);
-  pcmBuffers = []; pcmLen = 0;
-
-  const wavBlob = encodeWAV(samples, sampleRate);
-  const buf = await wavBlob.arrayBuffer();
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-
-  sttBusy = true; flushes++; lastFlushAt = now(); updateDiag({msg:`flush ${manual?'(manual)':''} size=${wavBlob.size}`});
-
+/*** ------- Отправка WAV каждые 2 сек ------- **/
+function startPCMCollector(){ clearInterval(sendTimer); sendTimer=setInterval(()=>flushWav(false),SEND_MS); }
+async function flushWav(manual){
+  if (sttBusy || pcmLen===0) return;
+  const samples=mergeFloat32(pcmBuffers,pcmLen); pcmBuffers=[]; pcmLen=0;
+  const wav=encodeWAV(samples,sampleRate);
+  const buf=await wav.arrayBuffer(); const b64=btoa(String.fromCharCode(...new Uint8Array(buf)));
+  sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush ${manual?'(manual)':''} size=${wav.size}`});
   try{
-    const resp = await fetch('/api/stt_student', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ audioBase64: b64, mime: 'audio/wav' })
-    });
-
-    if(!resp.ok){
-      const txt = await resp.text().catch(()=> '');
-      updateDiag({msg:`/api/stt_student ${resp.status} ${resp.statusText} ${txt.slice(0,200)}`});
-    }else{
-      const data = await resp.json().catch(()=> ({}));
-      const text = (data?.text || '').trim();
+    const r=await fetch('/api/stt_student',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audioBase64:b64,mime:'audio/wav'})});
+    if(!r.ok){ const t=await r.text().catch(()=> ''); updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`}); }
+    else{
+      const d=await r.json().catch(()=> ({})); const text=(d?.text||'').trim();
       if(text){
-        sFull += (sFull ? ' ' : '') + text;
-        studentOut.textContent = sFull;
-        const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
-        clearTimeout(sPauseTimer); sPauseTimer = setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS);
-      }else{
-        updateDiag({msg:'STT ok, but empty text'});
-      }
+        sFull+=(sFull?' ':'')+text; studentOut.textContent=sFull;
+        const st=tail(sFull); if(st && st!==sLast){ sLast=st; requestHints(); }
+        clearTimeout(sPauseTimer); sPauseTimer=setTimeout(()=>{ sFull=''; sLast=''; studentOut.textContent='—'; }, PAUSE_MS);
+      }else updateDiag({msg:'STT ok, but empty text'});
     }
-  }catch(e){
-    updateDiag({msg:`upload error: ${e.message}`});
-  }finally{
-    sttBusy = false; updateDiag();
-  }
+  }catch(e){ updateDiag({msg:`upload error: ${e.message}`}); }
+  finally{ sttBusy=false; updateDiag(); }
 }
 
+/*** ------- Старт студента (упрощённая цепочка) ------- **/
 async function startStudent(){
-  try{
-    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
-  }catch{ alert("Выбор вкладки отменён"); return; }
+  try{ displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true}); }
+  catch{ alert('Выбор вкладки отменён'); return; }
 
-  const aTracks = displayStream.getAudioTracks();
-  if(!aTracks || aTracks.length===0){
-    alert('Нет аудио! Включи "Share tab audio".');
-    displayStream.getTracks().forEach(t=>t.stop());
-    displayStream=null;
-    return;
-  }
+  const aTracks=displayStream.getAudioTracks();
+  if(!aTracks||!aTracks.length){ alert('Нет аудио! Включи "Share tab audio".'); displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return; }
+  srcStream=new MediaStream([aTracks[0]]);
 
-  srcStream = new MediaStream([aTracks[0]]);
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  await audioCtx.resume();                          // 🔸 гарантированно «будим» контекст
+  sampleRate=audioCtx.sampleRate;
 
-  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-  sampleRate = audioCtx.sampleRate;
+  sourceNode=audioCtx.createMediaStreamSource(srcStream);
+  gainNode=audioCtx.createGain(); gainNode.gain.value=3.0;
+  analyser=audioCtx.createAnalyser(); analyser.fftSize=512;
 
-  sourceNode = audioCtx.createMediaStreamSource(srcStream);
+  // ScriptProcessor: 2 входных канала (если стерео), чтобы Chrome сам смесил
+  const BUFFER_SIZE=4096;
+  scriptNode=audioCtx.createScriptProcessor(BUFFER_SIZE,2,2);
+  scriptNode.onaudioprocess=e=>{
+    procCalls++;
+    const ch0=e.inputBuffer.getChannelData(0);
+    const ch1 = e.inputBuffer.numberOfChannels>1 ? e.inputBuffer.getChannelData(1) : null;
 
-  // моно: берём левый канал (можно миксовать оба — для простоты берём один)
-  splitter = audioCtx.createChannelSplitter(2);
-  merger   = audioCtx.createChannelMerger(1);
-  sourceNode.connect(splitter);
-  splitter.connect(merger, 0, 0);
-
-  gainNode = audioCtx.createGain();
-  gainNode.gain.value = 3.0; // небольшой буст
-
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 512;
-
-  // ScriptProcessor для получения PCM (работает в Chrome, да, он deprecated, но стабилен)
-  const BUFFER_SIZE = 4096;
-  scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
-  scriptNode.onaudioprocess = (e) => {
-    const ch = e.inputBuffer.getChannelData(0);
-    // копируем, т.к. e.inputBuffer переиспользуется
-    pcmBuffers.push(new Float32Array(ch));
-    pcmLen += ch.length;
+    // миксуем два канала в моно
+    const N=ch0.length; const mono=new Float32Array(N);
+    if(ch1){ for(let i=0;i<N;i++){ mono[i]=(ch0[i]+ch1[i])*0.5; } }
+    else   { mono.set(ch0); }
 
     // RMS для диагностики
-    let sum=0; for(let i=0;i<ch.length;i++){ const v=ch[i]; sum+=v*v; }
-    rms = Math.sqrt(sum/ch.length);
+    let sum=0; for(let i=0;i<N;i++){ const v=mono[i]; sum+=v*v; } rms=Math.sqrt(sum/N);
+
+    // копим
+    pcmBuffers.push(mono); pcmLen+=mono.length;
   };
 
-  // цепочка: mono → gain → analyser → script (прослушивание не нужно)
-  merger.connect(gainNode);
+  // Соединяем: source → gain → analyser & script → destination
+  sourceNode.connect(gainNode);
   gainNode.connect(analyser);
   gainNode.connect(scriptNode);
-  scriptNode.connect(audioCtx.destination); // обязательно коннектим в граф (звук можно не слышать)
+  scriptNode.connect(audioCtx.destination);  // важно подключить в граф
 
-  // если вкладку перестали шарить — остановим
-  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', stopStudent));
+  // если перестали шарить вкладку — стоп
+  displayStream.getVideoTracks().forEach(tr=>tr.addEventListener('ended',stopStudent));
 
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
-  flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0;
+  flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0; procCalls=0;
 
   startPCMCollector();
-  document.getElementById('tabBtn').disabled = true;
-  document.getElementById('stopStudent').disabled = false;
-  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
+  document.getElementById('tabBtn').disabled=true;
+  document.getElementById('stopStudent').disabled=false;
+  statusEl.textContent=keepTeacher?'listening (teacher + student)':'listening (student)';
   updateDiag();
+
+  // Подсказка если через 5 сек pcmLen всё ещё 0
+  setTimeout(()=>{ if(pcmLen===0) updateDiag({msg:'Нет PCM. Проверь "Share tab audio" и громкость в источнике.'}); }, 5000);
 }
 
 function stopStudent(){
   clearInterval(sendTimer); sendTimer=null;
-
   try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
   try{ analyser && analyser.disconnect(); }catch{} analyser=null;
   try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
-  try{ splitter && splitter.disconnect(); }catch{} splitter=null;
-  try{ merger && merger.disconnect(); }catch{} merger=null;
   try{ sourceNode && sourceNode.disconnect(); }catch{} sourceNode=null;
-
   if(audioCtx){ try{ audioCtx.close(); }catch{} audioCtx=null; }
-
   if(displayStream){ try{ displayStream.getTracks().forEach(t=>t.stop()); }catch{} displayStream=null; }
   if(srcStream){ try{ srcStream.getTracks().forEach(t=>t.stop()); }catch{} srcStream=null; }
-
-  document.getElementById('tabBtn').disabled = false;
-  document.getElementById('stopStudent').disabled = true;
-
+  document.getElementById('tabBtn').disabled=false;
+  document.getElementById('stopStudent').disabled=true;
   if(!keepTeacher) statusEl.textContent='idle';
   updateDiag({msg:'student stopped'});
 }
 
-/*** ------------ AI hints ------------ ***/
+/*** ------- Подсказки ------- **/
 let busy=false;
 async function requestHints(){
   if(busy) return; busy=true;
   try{
-    const r = await fetch('/api/hints', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ teacher: tFull, student: sFull })
-    });
-    const d = await r.json();
-    if(d?.card) prependCard(d.card);
+    const r=await fetch('/api/hints',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teacher:tFull,student:sFull})});
+    const d=await r.json(); if(d?.card) prependCard(d.card);
   }catch(e){ console.warn(e); }
   busy=false;
 }
 function prependCard(card){
-  const hasContent=(card.errors&&card.errors.length)||(card.definitions&&card.definitions.length)||(card.synonyms&&card.synonyms.length);
-  if(!hasContent) return;
+  const has=(card.errors&&card.errors.length)||(card.definitions&&card.definitions.length)||(card.synonyms&&card.synonyms.length);
+  if(!has) return;
   const div=document.createElement('div'); div.className='entry';
   div.innerHTML=`<div class="cols">
     <div class="col error"><h4>Errors & Fix</h4><div class="errors"></div></div>
@@ -364,20 +290,18 @@ function prependCard(card){
   feed.prepend(div); while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-/*** ------------ Quick test ------------ ***/
-document.getElementById('sendManual').onclick = () => {
-  const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
-  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull;
-  const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
-  el.value=''; clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
+/*** ------- Quick test ------- **/
+document.getElementById('sendManual').onclick=()=>{ const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
+  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull; const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); } el.value='';
+  clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=''; tLast=''; teacherOut.textContent='—'; }, PAUSE_MS);
 };
 
-/*** ------------ Bind ------------ ***/
-document.getElementById('micBtn').onclick = startTeacher;
-document.getElementById('stopTeacher').onclick = stopTeacher;
-document.getElementById('tabBtn').onclick = startStudent;
-document.getElementById('stopStudent').onclick = stopStudent;
-document.getElementById('forceFlush').onclick = () => flushWav(true);
+/*** ------- Bind ------- **/
+document.getElementById('micBtn').onclick=startTeacher;
+document.getElementById('stopTeacher').onclick=stopTeacher;
+document.getElementById('tabBtn').onclick=startStudent;
+document.getElementById('stopStudent').onclick=stopStudent;
+document.getElementById('forceFlush').onclick=()=>flushWav(true);
 
 updateDiag();
 </script>
