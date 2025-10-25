@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Teacher — AI Hints (FAST Recorder)</title>
+  <title>Teacher — AI Hints (FAST Recorder + WebM→WAV fallback)</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#fafbff}
     .wrap{max-width:1200px;margin:0 auto}
@@ -37,7 +37,6 @@
 </head>
 <body>
 
-<!-- держим звуковой тракт вкладки “живым” -->
 <audio id="tabAudioSink" autoplay muted playsinline style="display:none"></audio>
 
 <div class="wrap">
@@ -104,7 +103,7 @@ let displayStream=null, srcStream=null;
 let audioCtx=null, sourceNode=null, gainNode=null, analyser=null, scriptNode=null;
 let sampleRate=48000;
 
-const PAUSE_MS=2500; // чуть быстрее очищаем фразу
+const PAUSE_MS=2500;
 let sPauseTimer=null, tPauseTimer=null;
 
 let pcmBuffers=[], pcmLen=0;
@@ -115,13 +114,13 @@ let uttSamples=0, speechActive=false, lastSpeechMs=0;
 const EMA_ALPHA = 0.15;
 const VAD_ENTER = 0.025;
 const VAD_EXIT  = 0.015;
-const MIN_UTT_MS = 600;   // короче минимальный кусок
-const SILENCE_MS = 300;   // быстрее считаем паузу
-const MAX_UTT_MS = 2200;  // не копим слишком долго
+const MIN_UTT_MS = 600;
+const SILENCE_MS = 300;
+const MAX_UTT_MS = 2200;
 const GAIN = 3.0;
 
 /* ====== FAST MODE (MediaRecorder) ====== */
-const RECORDER_TIMESLICE = 900; // ~0.9с куски
+const RECORDER_TIMESLICE = 900;
 let recorder=null;
 
 /* ====== UI ====== */
@@ -181,7 +180,7 @@ function stopTeacher(){
   if(!speechActive) statusEl.textContent='idle';
 }
 
-/* ====== WAV helpers (fallback путь) ====== */
+/* ====== WAV helpers ====== */
 function floatTo16BitPCM(input){
   const out=new Int16Array(input.length);
   for(let i=0;i<input.length;i++){let s=Math.max(-1,Math.min(1,input[i]));out[i]=s<0?s*0x8000:s*0x7FFF;}
@@ -209,35 +208,77 @@ function u8ToBase64(u8){
   } return btoa(binary);
 }
 
-/* ====== Upload helper (принимает Blob любого типа) ====== */
+/* ====== Transcode: WebM/Opus → WAV (моно) ====== */
+async function transcodeWebmToWav(webmBlob){
+  const ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 48000*10, 48000); // запас до 10s
+  const buf = await webmBlob.arrayBuffer();
+  // decode с обычным AudioContext надёжнее в браузерах
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioBuf = await ctx.decodeAudioData(buf);
+  try{ ctx.close(); }catch{}
+  const ch0 = audioBuf.getChannelData(0);
+  // если есть 2й канал — усредняем
+  let mono = ch0;
+  if (audioBuf.numberOfChannels > 1){
+    const ch1 = audioBuf.getChannelData(1);
+    mono = new Float32Array(ch0.length);
+    for (let i=0;i<ch0.length;i++) mono[i] = (ch0[i] + ch1[i]) * 0.5;
+  }
+  return encodeWAV(mono, audioBuf.sampleRate || 48000);
+}
+
+/* ====== Upload helper (любой Blob, с авто-фолбэком на WAV) ====== */
+async function sendToSTT(b64, mime){
+  return fetch('/api/stt_student',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({audioBase64:b64, mime})
+  });
+}
+
 async function uploadBlob(blob, mime){
-  const buf=await blob.arrayBuffer();
-  const b64=u8ToBase64(new Uint8Array(buf));
-  sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush size=${blob.size} (${mime})`});
+  sttBusy=true; flushes++; lastFlushAt=now();
+  updateDiag({msg:`flush size=${blob.size} (${mime})`});
+
+  // 1) Пробуем как есть
   try{
-    const r=await fetch('/api/stt_student',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({audioBase64:b64,mime})
-    });
+    const buf=await blob.arrayBuffer();
+    const b64=u8ToBase64(new Uint8Array(buf));
+    let r = await sendToSTT(b64, mime);
+
+    // 2) Если сервер вернул 400 на webm — автоматический транскод в WAV и повтор
+    if (r.status === 400 && mime !== 'audio/wav'){
+      updateDiag({msg:`400 on ${mime} → transcoding to WAV...`});
+      const wav = await transcodeWebmToWav(blob);
+      const buf2 = await wav.arrayBuffer();
+      const b64wav = u8ToBase64(new Uint8Array(buf2));
+      r = await sendToSTT(b64wav, 'audio/wav');
+    }
+
     if(!r.ok){
-      const t=await r.text().catch(()=> ''); updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`});
-    }else{
+      const t=await r.text().catch(()=> '');
+      updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`});
+    } else {
       const d=await r.json().catch(()=> ({}));
       const text=(d?.text||'').trim();
       if(text){
         sFull+=(sFull?' ':'')+text; studentOut.textContent=sFull;
         const st=tail(sFull); if(st && st!==sLast){ sLast=st; requestHints(); }
-        clearTimeout(sPauseTimer); sPauseTimer=setTimeout(()=>{ sFull=''; sLast=''; studentOut.textContent='—'; }, PAUSE_MS);
-      }else updateDiag({msg:'STT ok, but empty text'});
+        clearTimeout(sPauseTimer);
+        sPauseTimer=setTimeout(()=>{ sFull=''; sLast=''; studentOut.textContent='—'; }, PAUSE_MS);
+      } else {
+        updateDiag({msg:'STT ok, but empty text'});
+      }
     }
-  }catch(e){ updateDiag({msg:`upload error: ${e.message}`}); }
-  finally{
+  }catch(e){
+    updateDiag({msg:`upload error: ${e.message}`});
+  }finally{
     sttBusy=false;
     updateDiag();
   }
 }
 
-/* ====== Upload (fallback WAV-путь) ====== */
+/* ====== Upload (fallback WAV-путь для VAD) ====== */
 async function uploadChunk(samples){
   if(!samples || samples.length===0) return;
   const wav=encodeWAV(samples,sampleRate);
@@ -262,7 +303,6 @@ async function startStudent(){
     displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return;
   }
 
-  // держим тракт “живым”
   const sinkEl=document.getElementById('tabAudioSink');
   try{ sinkEl.srcObject=displayStream; sinkEl.muted=true; await sinkEl.play(); }catch(e){ console.warn('tabAudioSink play() failed', e); }
 
@@ -275,30 +315,27 @@ async function startStudent(){
   const wantFast = document.getElementById('fastMode').checked && window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus');
 
   if (wantFast){
-    // ---------- FAST MODE: маленькие OPUS-чанки каждые ~0.9s ----------
     try{
       recorder = new MediaRecorder(srcStream, {
         mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 32000 // меньше битрейт — меньше задержка на аплоад
+        audioBitsPerSecond: 32000
       });
       recorder.ondataavailable = (ev)=>{
         if (ev.data && ev.data.size>0 && !sttBusy){
-          uploadBlob(ev.data, 'audio/webm'); // сервер уже умеет webm (ты это включил)
+          uploadBlob(ev.data, 'audio/webm'); // при 400 сам перекодирует в WAV
         }
       };
       recorder.start(RECORDER_TIMESLICE);
       updateDiag({msg:'FAST mode (MediaRecorder) started'});
     }catch(e){
       updateDiag({msg:`FAST mode failed, fallback: ${e.message}`});
-      await startStudentFallbackVAD(); // перейти на VAD, если что-то пошло не так
+      await startStudentFallbackVAD();
       return;
     }
   } else {
-    // ---------- FALLBACK: VAD + WAV ----------
     await startStudentFallbackVAD();
   }
 
-  // reset UI/state
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
   flushes=0; lastFlushAt='—'; sttBusy=false; procCalls=0; ema=0; speechActive=false; uttSamples=0;
   document.getElementById('tabBtn').disabled=true;
@@ -307,11 +344,11 @@ async function startStudent(){
   updateDiag();
 
   setTimeout(()=>{ if(!wantFast && procCalls===0)
-    updateDiag({msg:'onaudioprocess не тикает — выбери именно Chrome Tab + Share tab audio; на вкладке должен идти звук.'});
+    updateDiag({msg:'onaudioprocess не тикает — выбери Chrome Tab + Share tab audio; на вкладке должен идти звук.'});
   }, 4000);
 }
 
-/* ====== FALLBACK путь: VAD + ScriptProcessor ====== */
+/* ====== FALLBACK: VAD + ScriptProcessor ====== */
 async function startStudentFallbackVAD(){
   audioCtx=new (window.AudioContext||window.webkitAudioContext)();
   await audioCtx.resume();
@@ -321,7 +358,7 @@ async function startStudentFallbackVAD(){
   gainNode  =audioCtx.createGain();   gainNode.gain.value=GAIN;
   analyser  =audioCtx.createAnalyser(); analyser.fftSize=512;
 
-  const BS=2048; // поменьше буфер — быстрее реакции
+  const BS=2048;
   scriptNode=audioCtx.createScriptProcessor(BS,2,2);
   scriptNode.onaudioprocess=(e)=>{
     procCalls++;
