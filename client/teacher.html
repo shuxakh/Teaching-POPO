@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Teacher — AI Hints (WAV + VAD)</title>
+  <title>Teacher — AI Hints (FAST Recorder)</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#fafbff}
     .wrap{max-width:1200px;margin:0 auto}
@@ -32,11 +32,12 @@
     .diag{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b1020;color:#d9e1ff;border-radius:12px;border:1px solid #263056;padding:12px;line-height:1.35;overflow:auto;position:relative}
     .ghost{position:absolute;right:8px;top:8px;opacity:.3}
     .diag:hover .ghost{opacity:1}
+    label.small{font-size:.9rem;color:#333}
   </style>
 </head>
 <body>
 
-<!-- приемник звука вкладки, чтобы Chrome не “глушил” аудио -->
+<!-- держим звуковой тракт вкладки “живым” -->
 <audio id="tabAudioSink" autoplay muted playsinline style="display:none"></audio>
 
 <div class="wrap">
@@ -53,6 +54,10 @@
         <label><b>Student:</b></label>
         <button id="tabBtn">🖥️ Student Tab (with audio)</button>
         <button id="stopStudent" disabled>⏹️ Stop</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input type="checkbox" id="fastMode" checked>
+        <label for="fastMode" class="small">Fast mode (Opus/WebM chunks ~0.8–1.0s)</label>
       </div>
       <p class="note" style="margin-top:6px">
         В диалоге Chrome выбери <b>Chrome Tab</b> и включи <b>Share tab audio</b>.
@@ -99,21 +104,25 @@ let displayStream=null, srcStream=null;
 let audioCtx=null, sourceNode=null, gainNode=null, analyser=null, scriptNode=null;
 let sampleRate=48000;
 
-const PAUSE_MS=4000;
+const PAUSE_MS=2500; // чуть быстрее очищаем фразу
 let sPauseTimer=null, tPauseTimer=null;
 
 let pcmBuffers=[], pcmLen=0;
 let sttBusy=false, flushes=0, lastFlushAt='—', rms=0, ema=0, procCalls=0;
 let uttSamples=0, speechActive=false, lastSpeechMs=0;
 
-/* ====== VAD ====== */
+/* ====== VAD (fallback) ====== */
 const EMA_ALPHA = 0.15;
 const VAD_ENTER = 0.025;
 const VAD_EXIT  = 0.015;
-const MIN_UTT_MS = 1000;
-const SILENCE_MS = 900;
-const MAX_UTT_MS = 6000;
+const MIN_UTT_MS = 600;   // короче минимальный кусок
+const SILENCE_MS = 300;   // быстрее считаем паузу
+const MAX_UTT_MS = 2200;  // не копим слишком долго
 const GAIN = 3.0;
+
+/* ====== FAST MODE (MediaRecorder) ====== */
+const RECORDER_TIMESLICE = 900; // ~0.9с куски
+let recorder=null;
 
 /* ====== UI ====== */
 const statusEl=document.getElementById('status');
@@ -172,7 +181,7 @@ function stopTeacher(){
   if(!speechActive) statusEl.textContent='idle';
 }
 
-/* ====== WAV helpers ====== */
+/* ====== WAV helpers (fallback путь) ====== */
 function floatTo16BitPCM(input){
   const out=new Int16Array(input.length);
   for(let i=0;i<input.length;i++){let s=Math.max(-1,Math.min(1,input[i]));out[i]=s<0?s*0x8000:s*0x7FFF;}
@@ -200,19 +209,15 @@ function u8ToBase64(u8){
   } return btoa(binary);
 }
 
-/* ====== Upload (без рекурсии) ====== */
-async function uploadChunk(samples){
-  if(!samples || samples.length===0) return;
-
-  const wav=encodeWAV(samples,sampleRate);
-  const buf=await wav.arrayBuffer();
+/* ====== Upload helper (принимает Blob любого типа) ====== */
+async function uploadBlob(blob, mime){
+  const buf=await blob.arrayBuffer();
   const b64=u8ToBase64(new Uint8Array(buf));
-
-  sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush size=${wav.size}`});
+  sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush size=${blob.size} (${mime})`});
   try{
     const r=await fetch('/api/stt_student',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({audioBase64:b64,mime:'audio/wav'})
+      body:JSON.stringify({audioBase64:b64,mime})
     });
     if(!r.ok){
       const t=await r.text().catch(()=> ''); updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`});
@@ -228,32 +233,36 @@ async function uploadChunk(samples){
   }catch(e){ updateDiag({msg:`upload error: ${e.message}`}); }
   finally{
     sttBusy=false;
-    // жёсткая очистка буферов, чтобы не зациклиться
-    pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
     updateDiag();
   }
+}
+
+/* ====== Upload (fallback WAV-путь) ====== */
+async function uploadChunk(samples){
+  if(!samples || samples.length===0) return;
+  const wav=encodeWAV(samples,sampleRate);
+  await uploadBlob(wav,'audio/wav');
 }
 function manualFlush(){
   if(pcmLen===0) return;
   const samples=mergeFloat32(pcmBuffers,pcmLen);
-  pcmBuffers=[]; pcmLen=0; uttSamples=0;
+  pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
   uploadChunk(samples);
 }
 
-/* ====== Student tab capture + VAD ====== */
+/* ====== START Student: FAST (MediaRecorder) ИЛИ fallback (VAD) ====== */
 async function startStudent(){
   try{
     displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
-  }catch{
-    alert('Выбор вкладки отменён'); return;
-  }
+  }catch{ alert('Выбор вкладки отменён'); return; }
+
   const aTracks=displayStream.getAudioTracks();
   if(!aTracks.length){
     alert('Нет аудио! Включи "Share tab audio".');
     displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return;
   }
 
-  // держим звуковой тракт "живым"
+  // держим тракт “живым”
   const sinkEl=document.getElementById('tabAudioSink');
   try{ sinkEl.srcObject=displayStream; sinkEl.muted=true; await sinkEl.play(); }catch(e){ console.warn('tabAudioSink play() failed', e); }
 
@@ -263,6 +272,47 @@ async function startStudent(){
   at.onended =()=>updateDiag({msg:'audio track ENDED'});
   srcStream=new MediaStream([at]);
 
+  const wantFast = document.getElementById('fastMode').checked && window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus');
+
+  if (wantFast){
+    // ---------- FAST MODE: маленькие OPUS-чанки каждые ~0.9s ----------
+    try{
+      recorder = new MediaRecorder(srcStream, {
+        mimeType: 'audio/webm;codecs=opus',
+        audioBitsPerSecond: 32000 // меньше битрейт — меньше задержка на аплоад
+      });
+      recorder.ondataavailable = (ev)=>{
+        if (ev.data && ev.data.size>0 && !sttBusy){
+          uploadBlob(ev.data, 'audio/webm'); // сервер уже умеет webm (ты это включил)
+        }
+      };
+      recorder.start(RECORDER_TIMESLICE);
+      updateDiag({msg:'FAST mode (MediaRecorder) started'});
+    }catch(e){
+      updateDiag({msg:`FAST mode failed, fallback: ${e.message}`});
+      await startStudentFallbackVAD(); // перейти на VAD, если что-то пошло не так
+      return;
+    }
+  } else {
+    // ---------- FALLBACK: VAD + WAV ----------
+    await startStudentFallbackVAD();
+  }
+
+  // reset UI/state
+  sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
+  flushes=0; lastFlushAt='—'; sttBusy=false; procCalls=0; ema=0; speechActive=false; uttSamples=0;
+  document.getElementById('tabBtn').disabled=true;
+  document.getElementById('stopStudent').disabled=false;
+  statusEl.textContent=keepTeacher?'listening (teacher + student)':'listening (student)';
+  updateDiag();
+
+  setTimeout(()=>{ if(!wantFast && procCalls===0)
+    updateDiag({msg:'onaudioprocess не тикает — выбери именно Chrome Tab + Share tab audio; на вкладке должен идти звук.'});
+  }, 4000);
+}
+
+/* ====== FALLBACK путь: VAD + ScriptProcessor ====== */
+async function startStudentFallbackVAD(){
   audioCtx=new (window.AudioContext||window.webkitAudioContext)();
   await audioCtx.resume();
   sampleRate=audioCtx.sampleRate;
@@ -271,7 +321,7 @@ async function startStudent(){
   gainNode  =audioCtx.createGain();   gainNode.gain.value=GAIN;
   analyser  =audioCtx.createAnalyser(); analyser.fftSize=512;
 
-  const BS=4096;
+  const BS=2048; // поменьше буфер — быстрее реакции
   scriptNode=audioCtx.createScriptProcessor(BS,2,2);
   scriptNode.onaudioprocess=(e)=>{
     procCalls++;
@@ -281,20 +331,16 @@ async function startStudent(){
     const mono=new Float32Array(N);
     if(ch1){ for(let i=0;i<N;i++) mono[i]=(ch0[i]+ch1[i])*0.5; } else mono.set(ch0);
 
-    // RMS + EMA
     let sum=0; for(let i=0;i<N;i++){const v=mono[i]; sum+=v*v;}
     const instRMS=Math.sqrt(sum/N);
     ema=EMA_ALPHA*instRMS+(1-EMA_ALPHA)*ema; rms=instRMS;
 
     const nowMs=performance.now();
-
-    // вход в речь
     if(!speechActive && ema>=VAD_ENTER){ speechActive=true; lastSpeechMs=nowMs; }
 
     if(speechActive){
       lastSpeechMs=nowMs;
       pcmBuffers.push(mono); pcmLen+=N; uttSamples+=N;
-
       const uttMs=(uttSamples/sampleRate)*1000;
       if(uttMs>=MAX_UTT_MS && !sttBusy){
         const samples=mergeFloat32(pcmBuffers,pcmLen);
@@ -303,7 +349,6 @@ async function startStudent(){
       }
     }
 
-    // выход из речи
     if(speechActive && ema<VAD_EXIT){
       if(nowMs-lastSpeechMs>SILENCE_MS && !sttBusy){
         const uttMs=(uttSamples/sampleRate)*1000;
@@ -322,26 +367,12 @@ async function startStudent(){
   gainNode.connect(analyser);
   gainNode.connect(scriptNode);
   scriptNode.connect(audioCtx.destination);
-
-  displayStream.getVideoTracks().forEach(tr=>tr.addEventListener('ended', stopStudent));
-
-  // reset
-  sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
-  flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0; procCalls=0; ema=0; speechActive=false; uttSamples=0;
-
-  document.getElementById('tabBtn').disabled=true;
-  document.getElementById('stopStudent').disabled=false;
-  statusEl.textContent=keepTeacher?'listening (teacher + student)':'listening (student)';
-  updateDiag();
-
-  // если обработчик не запускается — подсказка
-  setTimeout(()=>{ if(procCalls===0)
-    updateDiag({msg:'onaudioprocess не тикает — выбери именно "Chrome Tab" и включи Share tab audio; на вкладке должен идти звук.'});
-  }, 4000);
 }
 
+/* ====== STOP Student ====== */
 function stopStudent(){
   try{ const sinkEl=document.getElementById('tabAudioSink'); sinkEl.pause(); sinkEl.srcObject=null; }catch{}
+  if(recorder){ try{ recorder.stop(); }catch{} recorder=null; }
   try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
   try{ analyser && analyser.disconnect(); }catch{} analyser=null;
   try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
@@ -405,7 +436,7 @@ document.getElementById('sendManual').onclick=()=>{
   tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull;
   const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); }
   el.value='';
-  clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=''; tLast=''; teacherOut.textContent='—'; }, PAUSE_MS);
+  clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=''; tLast=''; teacherOut.textContent='—'; }, 2000);
 };
 
 /* ====== BINDINGS ====== */
