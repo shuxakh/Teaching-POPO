@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Teacher — AI Hints</title>
+  <title>Teacher — AI Hints (WAV student)</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#fafbff}
     .wrap{max-width:1200px;margin:0 auto}
@@ -91,29 +91,11 @@
 </div>
 
 <script>
-/*** ------- глобальное состояние ------- ***/
+/*** ------------ общее состояние ------------ ***/
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
-let displayStream=null, srcStream=null, boostedStream=null, mediaRec=null;
-
-const MIME_CHAIN=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4',''];
-let mimeIdx=0;
-
-const CHUNK_MS=1000;
-const AGG_MS=3000;        // ⬅️ буфер 3с (раньше 4.5)
-const HARD_FLUSH_MS=7000; // максимум 7с — отправим даже в тишине
-const PAUSE_MS=4000;
-
-let tPauseTimer=null, sPauseTimer=null;
-let studentPulse=null, studentWatchdog=null, flushTicker=null;
-let lastChunkTs=0, chunkCount=0, lastSize=0;
-let studentStopRequested=false;
-
-let aggBlobs=[], aggMs=0, aggStart=0, sttBusy=false;
-
-let audioCtx=null, analyser=null, gainNode=null, rms=0;
-const VAD_TH=0.003; // мягкий порог
-
-let flushCount=0, lastFlushAt='—';
+let displayStream=null, srcStream=null;
+let audioCtx=null, sourceNode=null, splitter=null, merger=null, gainNode=null, scriptNode=null, analyser=null;
+let sampleRate=48000;
 
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
@@ -121,233 +103,248 @@ const studentOut=document.getElementById('studentOut');
 const feed=document.getElementById('feed');
 const diagEl=document.getElementById('diag');
 
-/*** ------- утилиты ------- ***/
+const SEND_MS = 2000;           // каждые 2с отправляем WAV-фрагмент
+const PAUSE_MS = 4000;          // очистка live transcript после паузы
+let sPauseTimer=null;
+
+// накопитель PCM
+let pcmBuffers=[]; // массив Float32Arrays
+let pcmLen=0;
+let sendTimer=null;
+let sttBusy=false;
+let flushes=0, lastFlushAt='—', rms=0;
+
+function now(){ return new Date().toLocaleTimeString(); }
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
-function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
-function clearAfterPause(which){
-  if(which==='t'){ clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS); }
-  else{ clearTimeout(sPauseTimer); sPauseTimer=setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS); }
-}
-function arrayBufferToBase64(buffer){ let binary=''; const bytes=new Uint8Array(buffer); for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]); return btoa(binary); }
-function now(){return new Date().toLocaleTimeString();}
-function updateDiag(extra={}){
-  const aTrack = boostedStream?.getAudioTracks?.()[0] || srcStream?.getAudioTracks?.()[0];
-  const vTrack = displayStream?.getVideoTracks?.()[0];
-  const age = lastChunkTs? ((Date.now()-lastChunkTs)/1000).toFixed(1)+'s' : '—';
-  const level = rms ? rms.toFixed(3) : '0.000';
-  const mime = mediaRec?.mimeType || MIME_CHAIN[mimeIdx] || 'auto';
-  const recState = mediaRec?.state || '—';
-  const aState = aTrack?.readyState || '—';
-  const vState = vTrack?.readyState || '—';
-  diagEl.firstChild && (diagEl.firstChild.textContent = '');
+function updateDiag(extra={}) {
   diagEl.innerHTML = `
 time: ${now()}<br>
-recorder: <span class="${recState==='recording'?'ok':'warn'}">${recState}</span>
-  • mime: <span class="chip">${mime}</span>
-  • chunks: ${chunkCount}
-  • lastSize: ${lastSize} bytes
-  • lastChunkAge: ${age}
-  • aggMs: ${aggMs}ms
-  • sttBusy: ${sttBusy}
-  • flushes: ${flushCount}
-  • lastFlushAt: ${lastFlushAt}<br>
-audio track: <span class="${aState==='live'?'ok':'bad'}">${aState}</span>
-  • level(RMS): ${level}
-  • boost: x${(gainNode?.gain?.value||1).toFixed(1)}<br>
-video track: ${vState}<br>
+mode: WAV/PCM  • sampleRate: ${sampleRate} • flushes: ${flushes} • sttBusy: ${sttBusy} • lastFlushAt: ${lastFlushAt}<br>
+pcmLen(samples): ${pcmLen} • level(RMS): ${rms.toFixed(3)} • boost: x${(gainNode?.gain?.value||1).toFixed(1)}<br>
 ${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
 <button id="forceFlush" class="ghost">Force flush</button>
-`.trim();
-  const ff=document.getElementById('forceFlush'); if(ff) ff.onclick=()=>flushAgg(true,true);
+`;
+  document.getElementById('forceFlush').onclick = () => flushWav(true);
 }
 
-/*** ------- Teacher (SR) ------- ***/
+/*** ------------ Teacher (SpeechRecognition) ------------ ***/
+function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
   SR=new S(); SR.lang='en-US'; SR.interimResults=true; SR.continuous=true;
-  SR.onresult=async e=>{
+  SR.onresult=e=>{
     let interim=''; for(let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i];
       if(r.isFinal){ const piece=r[0].transcript.trim(); if(!piece) continue;
         tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
         const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
-        clearAfterPause('t');
-      } else { interim+=r[0].transcript; }
+        clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
+      }else{ interim+=r[0].transcript; }
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
   SR.onerror=()=>{}; SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
+let tPauseTimer=null;
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
   if(!SR) initSR(); try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
   tFull=""; tLast=""; teacherOut.textContent="Listening (Teacher Mic)…";
   keepTeacher=true; SR.start(); document.getElementById('micBtn').disabled=true; document.getElementById('stopTeacher').disabled=false;
-  statusEl.textContent='listening (teacher)'; clearAfterPause('t');
+  statusEl.textContent='listening (teacher)';
 }
 function stopTeacher(){
   keepTeacher=false; try{ SR && SR.stop(); }catch{} document.getElementById('micBtn').disabled=false; document.getElementById('stopTeacher').disabled=true;
-  if(!mediaRec) statusEl.textContent='idle';
+  if(!sendTimer) statusEl.textContent='idle';
 }
 
-/*** ------- Student (tab → boost → recorder → Whisper) ------- ***/
-async function startStudent(){
-  try{ displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true }); }
-  catch{ alert('Выбор вкладки отменён.'); return; }
-
-  const aTracks = displayStream.getAudioTracks();
-  if(!aTracks || aTracks.length===0){ alert('Нет аудио! Включи "Share tab audio".'); displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return; }
-  const srcTrack = aTracks[0]; srcStream = new MediaStream([srcTrack]);
-
-  try{
-    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-    const source = audioCtx.createMediaStreamSource(srcStream);
-    gainNode = audioCtx.createGain(); gainNode.gain.value = 2.5;
-    analyser = audioCtx.createAnalyser(); analyser.fftSize = 512;
-    const dest = audioCtx.createMediaStreamDestination();
-    source.connect(gainNode); gainNode.connect(analyser); gainNode.connect(dest);
-    boostedStream = dest.stream;
-    const data = new Uint8Array(analyser.fftSize);
-    (function meter(){ if(!analyser) return; analyser.getByteTimeDomainData(data);
-      let sum=0; for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
-      rms = Math.sqrt(sum/data.length); updateDiag(); requestAnimationFrame(meter);
-    })();
-  }catch(e){ boostedStream = srcStream; updateDiag({msg:'boost disabled: '+e.message}); }
-
-  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => { updateDiag({msg:'display video ended'}); stopStudent(); }));
-
-  sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
-  studentStopRequested=false; chunkCount=0; lastSize=0; lastChunkTs=0; mimeIdx=0;
-  aggBlobs=[]; aggMs=0; sttBusy=false; aggStart=Date.now(); flushCount=0; lastFlushAt='—';
-
-  startRecorderWithCurrentMime();
-
-  clearInterval(studentPulse);
-  studentPulse = setInterval(() => { try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{} }, CHUNK_MS);
-
-  clearInterval(studentWatchdog);
-  studentWatchdog = setInterval(() => {
-    const gap = Date.now() - (lastChunkTs||0);
-    if (mediaRec && mediaRec.state==='recording' && gap > 6000) {
-      updateDiag({msg:`watchdog: restart (gap=${gap}ms)`});
-      try { mediaRec.stop(); } catch {}
-    }
-  }, 2000);
-
-  clearInterval(flushTicker);
-  flushTicker = setInterval(checkFlush, 1000);
-
-  document.getElementById('tabBtn').disabled=true; document.getElementById('stopStudent').disabled=false;
-  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
-  clearAfterPause('s');
-}
-
-function startRecorderWithCurrentMime(force=false){
-  if (!boostedStream) return;
-  if (mediaRec && !force) { try{ mediaRec.start(CHUNK_MS); }catch{} return; }
-  try{
-    const conf = MIME_CHAIN[mimeIdx] ? { mimeType: MIME_CHAIN[mimeIdx], audioBitsPerSecond: 128000 } : { audioBitsPerSecond: 128000 };
-    mediaRec = new MediaRecorder(boostedStream, conf);
-  }catch(e){ updateDiag({msg:`init fail for ${MIME_CHAIN[mimeIdx]}: ${e.message}`}); mimeIdx=(mimeIdx+1)%MIME_CHAIN.length; return startRecorderWithCurrentMime(true); }
-
-  mediaRec.ondataavailable = (ev) => {
-    if(!ev.data || ev.data.size < 800){ updateDiag({msg:'tiny chunk skipped'}); return; }
-    lastChunkTs = Date.now(); chunkCount++; lastSize = ev.data.size;
-    aggBlobs.push(ev.data); aggMs += CHUNK_MS; updateDiag();
-  };
-  mediaRec.onstop = ()=>{ updateDiag({msg:'recorder stopped'}); if(!studentStopRequested && boostedStream?.getAudioTracks?.()[0]?.readyState==='live'){ setTimeout(()=>startRecorderWithCurrentMime(true), 200); } };
-  mediaRec.onerror = e=> updateDiag({msg:`recorder error: ${e.name||e.message}`});
-  mediaRec.onstart = ()=> updateDiag({msg:'recorder started'});
-  try{ mediaRec.start(CHUNK_MS); }catch(e){ updateDiag({msg:`start failed: ${e.message}`}); mimeIdx=(mimeIdx+1)%MIME_CHAIN.length; startRecorderWithCurrentMime(true); }
-}
-
-function checkFlush(){
-  const hard = (Date.now()-aggStart) >= HARD_FLUSH_MS;
-  if (!sttBusy && aggBlobs.length && (aggMs >= AGG_MS || hard)) {
-    flushAgg(hard /*force*/, false /*manual*/);
+/*** ------------ Student: захват вкладки → моно → WAV ------------ ***/
+function floatTo16BitPCM(input) {
+  const output = new Int16Array(input.length);
+  for (let i=0;i<input.length;i++) {
+    let s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
+  return output;
 }
 
-async function flushAgg(force=false, manual=false){
-  if (!aggBlobs.length || sttBusy) return;
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
 
-  if (!force && rms < VAD_TH && aggMs < HARD_FLUSH_MS) {
-    updateDiag({msg:`VAD hold (rms=${rms.toFixed(3)})`});
-    return;
-  }
+  function writeString(offset, string) { for (let i=0;i<string.length;i++) view.setUint8(offset+i, string.charCodeAt(i)); }
 
-  let blob = new Blob(aggBlobs, { type: aggBlobs[0].type || 'audio/webm' });
-  // ограничим размер тела в ~4 МБ (на всякий случай)
-  const MAX = 4 * 1024 * 1024;
-  if (blob.size > MAX) blob = blob.slice(blob.size - MAX);
+  // RIFF header
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);        // PCM
+  view.setUint16(20, 1, true);         // PCM
+  view.setUint16(22, 1, true);         // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);         // block align
+  view.setUint16(34, 16, true);        // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
 
-  aggBlobs=[]; aggMs=0; aggStart=Date.now();
-  sttBusy = true; flushCount++; lastFlushAt=now();
-  updateDiag({msg:`flush → ${manual?'manual':'auto'} (${blob.size} bytes)`});
+  const pcm16 = floatTo16BitPCM(samples);
+  new Int16Array(buffer, 44).set(pcm16);
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function mergeFloat32(buffers, totalLength) {
+  const result = new Float32Array(totalLength);
+  let offset = 0;
+  for (const b of buffers) { result.set(b, offset); offset += b.length; }
+  return result;
+}
+
+function startPCMCollector() {
+  // каждые 2 секунды — собрать текущий буфер, в WAV и отправить
+  clearInterval(sendTimer);
+  sendTimer = setInterval(() => flushWav(false), SEND_MS);
+}
+
+async function flushWav(manual=false) {
+  if (sttBusy || pcmLen === 0) return;
+  const samples = mergeFloat32(pcmBuffers, pcmLen);
+  pcmBuffers = []; pcmLen = 0;
+
+  const wavBlob = encodeWAV(samples, sampleRate);
+  const buf = await wavBlob.arrayBuffer();
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+  sttBusy = true; flushes++; lastFlushAt = now(); updateDiag({msg:`flush ${manual?'(manual)':''} size=${wavBlob.size}`});
 
   try{
-    const buf = await blob.arrayBuffer();
-    const b64 = arrayBufferToBase64(buf);
-
     const resp = await fetch('/api/stt_student', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ audioBase64: b64 })
+      body: JSON.stringify({ audioBase64: b64, mime: 'audio/wav' })
     });
 
-    if (!resp.ok) {
+    if(!resp.ok){
       const txt = await resp.text().catch(()=> '');
       updateDiag({msg:`/api/stt_student ${resp.status} ${resp.statusText} ${txt.slice(0,200)}`});
-      return;
+    }else{
+      const data = await resp.json().catch(()=> ({}));
+      const text = (data?.text || '').trim();
+      if(text){
+        sFull += (sFull ? ' ' : '') + text;
+        studentOut.textContent = sFull;
+        const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
+        clearTimeout(sPauseTimer); sPauseTimer = setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS);
+      }else{
+        updateDiag({msg:'STT ok, but empty text'});
+      }
     }
-
-    const data = await resp.json().catch(()=> ({}));
-    const text = (data?.text || '').trim();
-    if(text){
-      sFull += (sFull ? ' ' : '') + text;
-      studentOut.textContent = sFull;
-      const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
-      clearAfterPause('s');
-    } else {
-      updateDiag({msg:'STT ok, but empty text'});
-    }
-  } catch(err){
-    updateDiag({msg:`upload/STT error: ${err.message}`});
-  } finally {
-    sttBusy = false;
-    updateDiag();
+  }catch(e){
+    updateDiag({msg:`upload error: ${e.message}`});
+  }finally{
+    sttBusy = false; updateDiag();
   }
 }
 
+async function startStudent(){
+  try{
+    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+  }catch{ alert("Выбор вкладки отменён"); return; }
+
+  const aTracks = displayStream.getAudioTracks();
+  if(!aTracks || aTracks.length===0){
+    alert('Нет аудио! Включи "Share tab audio".');
+    displayStream.getTracks().forEach(t=>t.stop());
+    displayStream=null;
+    return;
+  }
+
+  srcStream = new MediaStream([aTracks[0]]);
+
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  sampleRate = audioCtx.sampleRate;
+
+  sourceNode = audioCtx.createMediaStreamSource(srcStream);
+
+  // моно: берём левый канал (можно миксовать оба — для простоты берём один)
+  splitter = audioCtx.createChannelSplitter(2);
+  merger   = audioCtx.createChannelMerger(1);
+  sourceNode.connect(splitter);
+  splitter.connect(merger, 0, 0);
+
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = 3.0; // небольшой буст
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+
+  // ScriptProcessor для получения PCM (работает в Chrome, да, он deprecated, но стабилен)
+  const BUFFER_SIZE = 4096;
+  scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+  scriptNode.onaudioprocess = (e) => {
+    const ch = e.inputBuffer.getChannelData(0);
+    // копируем, т.к. e.inputBuffer переиспользуется
+    pcmBuffers.push(new Float32Array(ch));
+    pcmLen += ch.length;
+
+    // RMS для диагностики
+    let sum=0; for(let i=0;i<ch.length;i++){ const v=ch[i]; sum+=v*v; }
+    rms = Math.sqrt(sum/ch.length);
+  };
+
+  // цепочка: mono → gain → analyser → script (прослушивание не нужно)
+  merger.connect(gainNode);
+  gainNode.connect(analyser);
+  gainNode.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination); // обязательно коннектим в граф (звук можно не слышать)
+
+  // если вкладку перестали шарить — остановим
+  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', stopStudent));
+
+  sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
+  flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0;
+
+  startPCMCollector();
+  document.getElementById('tabBtn').disabled = true;
+  document.getElementById('stopStudent').disabled = false;
+  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
+  updateDiag();
+}
+
 function stopStudent(){
-  studentStopRequested = true;
-  try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{} mediaRec = null;
+  clearInterval(sendTimer); sendTimer=null;
 
-  clearInterval(studentPulse); studentPulse=null;
-  clearInterval(studentWatchdog); studentWatchdog=null;
-  clearInterval(flushTicker); flushTicker=null;
+  try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
+  try{ analyser && analyser.disconnect(); }catch{} analyser=null;
+  try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
+  try{ splitter && splitter.disconnect(); }catch{} splitter=null;
+  try{ merger && merger.disconnect(); }catch{} merger=null;
+  try{ sourceNode && sourceNode.disconnect(); }catch{} sourceNode=null;
 
-  if(boostedStream){ try{ boostedStream.getTracks().forEach(t=>t.stop()); }catch{} boostedStream=null; }
-  if(srcStream){ try{ srcStream.getTracks().forEach(t=>t.stop()); }catch{} srcStream=null; }
-  if(displayStream){ try{ displayStream.getTracks().forEach(t=>t.stop()); }catch{} displayStream=null; }
-
-  if(analyser){ try{ analyser.disconnect(); }catch{} analyser=null; }
-  if(gainNode){ try{ gainNode.disconnect(); }catch{} gainNode=null; }
   if(audioCtx){ try{ audioCtx.close(); }catch{} audioCtx=null; }
 
-  rms = 0; aggBlobs=[]; aggMs=0; sttBusy=false; flushCount=0; lastFlushAt='—';
+  if(displayStream){ try{ displayStream.getTracks().forEach(t=>t.stop()); }catch{} displayStream=null; }
+  if(srcStream){ try{ srcStream.getTracks().forEach(t=>t.stop()); }catch{} srcStream=null; }
 
-  document.getElementById('tabBtn').disabled=false; document.getElementById('stopStudent').disabled=true;
-  statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
+  document.getElementById('tabBtn').disabled = false;
+  document.getElementById('stopStudent').disabled = true;
+
+  if(!keepTeacher) statusEl.textContent='idle';
   updateDiag({msg:'student stopped'});
 }
 
-/*** ------- AI hints ------- ***/
+/*** ------------ AI hints ------------ ***/
 let busy=false;
 async function requestHints(){
   if(busy) return; busy=true;
   try{
-    const r = await fetch('/api/hints', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ teacher: tFull, student: sFull }) });
-    const d = await r.json(); if(d?.card) prependCard(d.card);
+    const r = await fetch('/api/hints', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ teacher: tFull, student: sFull })
+    });
+    const d = await r.json();
+    if(d?.card) prependCard(d.card);
   }catch(e){ console.warn(e); }
   busy=false;
 }
@@ -367,16 +364,20 @@ function prependCard(card){
   feed.prepend(div); while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-/*** ------- Quick test ------- ***/
-document.getElementById('sendManual').onclick=()=>{ const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
-  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull; const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); } el.value=''; clearAfterPause('t'); };
+/*** ------------ Quick test ------------ ***/
+document.getElementById('sendManual').onclick = () => {
+  const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
+  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull;
+  const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
+  el.value=''; clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
+};
 
-/*** ------- Bind ------- ***/
+/*** ------------ Bind ------------ ***/
 document.getElementById('micBtn').onclick = startTeacher;
 document.getElementById('stopTeacher').onclick = stopTeacher;
 document.getElementById('tabBtn').onclick = startStudent;
 document.getElementById('stopStudent').onclick = stopStudent;
-document.getElementById('forceFlush').onclick = ()=>flushAgg(true,true);
+document.getElementById('forceFlush').onclick = () => flushWav(true);
 
 updateDiag();
 </script>
