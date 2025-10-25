@@ -11,42 +11,37 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// важные лимиты тела запроса
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// статические файлы (клиент)
 app.use(express.static(path.join(__dirname, "..", "client")));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ===== STT: студент =====
 app.post("/api/stt_student", async (req, res) => {
   try {
     const { audioBase64, mime } = req.body || {};
     if (!audioBase64) return res.status(400).json({ error: "no audioBase64" });
 
     const buf = Buffer.from(audioBase64, "base64");
-
-    // подберём корректный mime/имя файла
     const isWav = mime === "audio/wav";
-    const filename = isWav ? "chunk.wav" : "chunk.webm";
-    const filetype = isWav ? "audio/wav" : "audio/webm";
+    const file = await toFile(buf, isWav ? "chunk.wav" : "chunk.webm", {
+      type: isWav ? "audio/wav" : "audio/webm",
+    });
 
-    const file = await toFile(buf, filename, { type: filetype });
-
-    // сперва пробуем быстрый транскрайб, при отсутствии — whisper-1
     let text = "";
     try {
       const r = await openai.audio.transcriptions.create({
         file,
         model: "gpt-4o-mini-transcribe",
+        language: "en",         // ⬅️ фиксируем язык
       });
       text = (r?.text || "").trim();
     } catch {
       const r2 = await openai.audio.transcriptions.create({
         file,
         model: "whisper-1",
+        language: "en",         // ⬅️ и здесь тоже
       });
       text = (r2?.text || "").trim();
     }
@@ -58,7 +53,6 @@ app.post("/api/stt_student", async (req, res) => {
   }
 });
 
-// ===== Карточки-подсказки =====
 app.post("/api/hints", async (req, res) => {
   try {
     const { teacher = "", student = "" } = req.body || {};
@@ -84,13 +78,11 @@ Input: """${input}"""`;
 
     let payload = {};
     try { payload = JSON.parse(chat.choices?.[0]?.message?.content || "{}"); } catch {}
-
     const card = {
       errors: Array.isArray(payload.errors) ? payload.errors : [],
       definitions: Array.isArray(payload.definitions) ? payload.definitions : [],
       synonyms: Array.isArray(payload.synonyms) ? payload.synonyms : [],
     };
-
     return res.json({ card });
   } catch (err) {
     console.error("hints error:", err?.response?.data || err.message);
@@ -98,7 +90,6 @@ Input: """${input}"""`;
   }
 });
 
-// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
