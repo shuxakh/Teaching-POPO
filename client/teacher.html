@@ -35,6 +35,10 @@
   </style>
 </head>
 <body>
+
+<!-- 🔊 Скрытый приёмник аудио вкладки (важно для Windows/Chrome) -->
+<audio id="tabAudioSink" autoplay muted playsinline style="display:none"></audio>
+
 <div class="wrap">
   <h1>Teacher Panel — Private AI Hints</h1>
 
@@ -89,7 +93,7 @@
 </div>
 
 <script>
-/*** ------- общее ------- ***/
+/*** ------- общие переменные ------- ***/
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let displayStream=null, srcStream=null;
 let audioCtx=null, sourceNode=null, gainNode=null, analyser=null, scriptNode=null;
@@ -102,13 +106,13 @@ let pcmBuffers=[], pcmLen=0;
 let sttBusy=false, flushes=0, lastFlushAt='—', rms=0, ema=0, procCalls=0;
 let uttSamples=0, speechActive=false, lastSpeechMs=0;
 
-// VAD параметры (подбираются по месту)
-const EMA_ALPHA = 0.15;          // сглаживание RMS
-const VAD_ENTER = 0.025;         // порог входа в речь (0.02–0.04)
-const VAD_EXIT  = 0.015;         // порог выхода из речи (гистерезис)
-const MIN_UTT_MS = 1000;         // минимум длительность одного куска, чтобы слать
-const SILENCE_MS = 900;          // пауза для завершения куска
-const MAX_UTT_MS = 6000;         // верхняя граница на длину фразы (fail-safe)
+// VAD параметры
+const EMA_ALPHA = 0.15;
+const VAD_ENTER = 0.025;
+const VAD_EXIT  = 0.015;
+const MIN_UTT_MS = 1000;
+const SILENCE_MS = 900;
+const MAX_UTT_MS = 6000;
 const GAIN = 3.0;
 
 const statusEl=document.getElementById('status');
@@ -188,68 +192,85 @@ async function flushWav(samples){
 }
 function manualFlush(){ if(pcmLen===0) return; const samples=mergeFloat32(pcmBuffers,pcmLen); pcmBuffers=[]; pcmLen=0; uttSamples=0; flushWav(samples); }
 
-/*** ------- Student start (VAD) ------- **/
+/*** ------- Student start (sink + VAD) ------- **/
 async function startStudent(){
-  try{ displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true}); }
-  catch{ alert('Выбор вкладки отменён'); return; }
+  try {
+    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+  } catch {
+    alert('Выбор вкладки отменён'); 
+    return;
+  }
 
-  const aTracks=displayStream.getAudioTracks();
-  if(!aTracks||!aTracks.length){ alert('Нет аудио! Включи "Share tab audio".'); displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return; }
-  srcStream=new MediaStream([aTracks[0]]);
+  const aTracks = displayStream.getAudioTracks();
+  if (!aTracks || !aTracks.length) {
+    alert('Нет аудио! Включи "Share tab audio".');
+    displayStream.getTracks().forEach(t => t.stop());
+    displayStream = null;
+    return;
+  }
 
-  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  // 🔊 «Подпираем» поток скрытым аудио — заставляет Chrome отдавать аудиокадры
+  const sinkEl = document.getElementById('tabAudioSink');
+  try {
+    sinkEl.srcObject = displayStream;
+    sinkEl.muted = true;
+    await sinkEl.play();
+  } catch (e) {
+    console.warn('tabAudioSink play() failed:', e);
+  }
+
+  const at = aTracks[0];
+  at.onmute   = () => updateDiag({msg:'audio track MUTED'});
+  at.onunmute = () => updateDiag({msg:'audio track UNMUTED'});
+  at.onended  = () => updateDiag({msg:'audio track ENDED'});
+
+  srcStream = new MediaStream([at]);
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
-  sampleRate=audioCtx.sampleRate;
+  sampleRate = audioCtx.sampleRate;
 
-  sourceNode=audioCtx.createMediaStreamSource(srcStream);
-  gainNode=audioCtx.createGain(); gainNode.gain.value=GAIN;
-  analyser=audioCtx.createAnalyser(); analyser.fftSize=512;
+  sourceNode = audioCtx.createMediaStreamSource(srcStream);
+  gainNode   = audioCtx.createGain();  gainNode.gain.value = GAIN;
+  analyser   = audioCtx.createAnalyser(); analyser.fftSize = 512;
 
-  // stereo→mono: просто суммируем каналы в ScriptProcessor
-  const BS=4096;
-  scriptNode=audioCtx.createScriptProcessor(BS,2,2);
-  scriptNode.onaudioprocess=e=>{
+  const BS = 4096;
+  scriptNode = audioCtx.createScriptProcessor(BS, 2, 2);
+  scriptNode.onaudioprocess = (e) => {
     procCalls++;
-    const ch0=e.inputBuffer.getChannelData(0);
-    const ch1=e.inputBuffer.numberOfChannels>1 ? e.inputBuffer.getChannelData(1) : null;
-    const N=ch0.length;
-    const mono=new Float32Array(N);
-    if(ch1){ for(let i=0;i<N;i++){ mono[i]=(ch0[i]+ch1[i])*0.5; } } else { mono.set(ch0); }
+    const ch0 = e.inputBuffer.getChannelData(0);
+    const ch1 = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : null;
+    const N = ch0.length;
+    const mono = new Float32Array(N);
+    if (ch1) { for (let i=0;i<N;i++) mono[i] = (ch0[i]+ch1[i]) * 0.5; }
+    else      { mono.set(ch0); }
 
     // RMS + EMA
-    let sum=0; for(let i=0;i<N;i++){ const v=mono[i]; sum+=v*v; }
-    const instRMS=Math.sqrt(sum/N);
-    ema = EMA_ALPHA*instRMS + (1-EMA_ALPHA)*ema;
-    rms = instRMS;
+    let sum=0; for (let i=0;i<N;i++){ const v=mono[i]; sum += v*v; }
+    const instRMS = Math.sqrt(sum/N);
+    ema = EMA_ALPHA*instRMS + (1-EMA_ALPHA)*ema; rms = instRMS;
 
-    // VAD: гистерезис
-    const nowMs=performance.now();
-    if(!speechActive && ema>=VAD_ENTER){
-      speechActive=true; lastSpeechMs=nowMs;
-    }
-    if(speechActive){
-      lastSpeechMs=nowMs;
-      pcmBuffers.push(mono); pcmLen+=N; uttSamples+=N;
-      // если речь слишком длинная — принудительно отправляем кусок
-      const uttMs = (uttSamples / sampleRate) * 1000;
-      if(uttMs >= MAX_UTT_MS && !sttBusy){
-        const samples=mergeFloat32(pcmBuffers,pcmLen); pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
+    // VAD
+    const nowMs = performance.now();
+    if (!speechActive && ema >= VAD_ENTER) { speechActive = true; lastSpeechMs = nowMs; }
+    if (speechActive) {
+      lastSpeechMs = nowMs;
+      pcmBuffers.push(mono); pcmLen += N; uttSamples += N;
+      const uttMs = (uttSamples/sampleRate)*1000;
+      if (uttMs >= MAX_UTT_MS && !sttBusy) {
+        const samples = mergeFloat32(pcmBuffers, pcmLen);
+        pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
         flushWav(samples);
       }
-    } else {
-      // речь не активна — аккумулировать не будем
     }
-
-    // завершение фразы по паузе
-    if(speechActive && ema<VAD_EXIT){
-      // подождём SILENCE_MS тишины
-      if(nowMs - lastSpeechMs > SILENCE_MS && !sttBusy){
-        const uttMs = (uttSamples / sampleRate) * 1000;
-        if(uttMs >= MIN_UTT_MS){
-          const samples=mergeFloat32(pcmBuffers,pcmLen); pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
+    if (speechActive && ema < VAD_EXIT) {
+      if (nowMs - lastSpeechMs > SILENCE_MS && !sttBusy) {
+        const uttMs = (uttSamples/sampleRate)*1000;
+        if (uttMs >= MIN_UTT_MS) {
+          const samples = mergeFloat32(pcmBuffers, pcmLen);
+          pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
           flushWav(samples);
         } else {
-          // короткий обрыв — просто сбрасываем без отправки
           pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
         }
       }
@@ -261,21 +282,32 @@ async function startStudent(){
   gainNode.connect(scriptNode);
   scriptNode.connect(audioCtx.destination);
 
-  displayStream.getVideoTracks().forEach(tr=>tr.addEventListener('ended',stopStudent));
+  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', stopStudent));
 
+  // сбросы/статус
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
   flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0; procCalls=0; ema=0; speechActive=false; uttSamples=0;
 
-  document.getElementById('tabBtn').disabled=true;
-  document.getElementById('stopStudent').disabled=false;
-  statusEl.textContent=keepTeacher?'listening (teacher + student)':'listening (student)';
+  document.getElementById('tabBtn').disabled = true;
+  document.getElementById('stopStudent').disabled = false;
+  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
   updateDiag();
 
-  // подсказка если нет PCM
-  setTimeout(()=>{ if(procCalls>0 && pcmLen===0) updateDiag({msg:'PCM не копится. Проверь громкость/Share tab audio.'}); }, 5000);
+  setTimeout(() => {
+    if (procCalls === 0) updateDiag({msg:'onaudioprocess не тикает — выбери именно "Chrome Tab" и включи Share tab audio, а на вкладке должен реально идти звук.'});
+  }, 4000);
 }
 
 function stopStudent(){
+  // остановим sink
+  try {
+    const sinkEl = document.getElementById('tabAudioSink');
+    if (sinkEl) {
+      try { sinkEl.pause(); } catch {}
+      sinkEl.srcObject = null;
+    }
+  } catch {}
+
   try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
   try{ analyser && analyser.disconnect(); }catch{} analyser=null;
   try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
