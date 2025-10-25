@@ -50,7 +50,6 @@
       </div>
       <p class="note" style="margin-top:6px">
         В диалоге Chrome выбери <b>Chrome Tab</b> и включи <b>Share tab audio</b>.
-        Если аудио не придёт, появится подсказка и запись не запустится.
       </p>
     </div>
 
@@ -83,10 +82,14 @@
 </div>
 
 <script>
-/* ====== общие ====== */
+/* ====== state & helpers ====== */
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let tabStream=null, mediaRec=null;
 const CHUNK_MS=1500;
+const PAUSE_MS=4000;   // авто-очистка после паузы
+let tPauseTimer=null, sPauseTimer=null;
+let studentPulse=null, studentWatchdog=null, lastChunkTs=0;
+
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
 const studentOut=document.getElementById('studentOut');
@@ -94,12 +97,24 @@ const feed=document.getElementById('feed');
 
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
 function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
-
-/* надёжный выбор mime */
+function clearAfterPause(which){
+  if(which==='t'){
+    clearTimeout(tPauseTimer);
+    tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
+  }else{
+    clearTimeout(sPauseTimer);
+    sPauseTimer=setTimeout(()=>{ sFull=""; sLast=""; studentOut.textContent="—"; }, PAUSE_MS);
+  }
+}
 function pickMime(){
   const cand=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'];
   for(const m of cand){ if(MediaRecorder.isTypeSupported?.(m)) return m; }
   return '';
+}
+function arrayBufferToBase64(buffer){
+  let binary=''; const bytes=new Uint8Array(buffer);
+  for(let i=0;i<bytes.length;i++) binary+=String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 /* ====== Teacher (SpeechRecognition) ====== */
@@ -115,23 +130,27 @@ function initSR(){
         const piece=r[0].transcript.trim(); if(!piece) continue;
         tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
         const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
+        clearAfterPause('t');
       } else {
         interim+=r[0].transcript;
       }
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
+  SR.onerror=()=>{};
+  SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
 
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
   if(!SR) initSR();
   try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
-  tFull=""; tLast="";
+  tFull=""; tLast=""; teacherOut.textContent="Listening (Teacher Mic)…";
   keepTeacher=true; SR.start();
   document.getElementById('micBtn').disabled=true;
   document.getElementById('stopTeacher').disabled=false;
   statusEl.textContent='listening (teacher)';
+  clearAfterPause('t');
 }
 function stopTeacher(){
   keepTeacher=false; try{ SR && SR.stop(); }catch{}
@@ -142,44 +161,29 @@ function stopTeacher(){
 
 /* ====== Student (tab audio → Whisper) ====== */
 async function startStudent(){
-  // 1) Получаем поток с вкладки
+  // 1) поток с вкладки
   let display;
-  try{
-    display = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
-  }catch{
-    alert('Выбор вкладки отменён.');
-    return;
-  }
+  try{ display = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true }); }
+  catch{ alert('Выбор вкладки отменён.'); return; }
 
-  // 2) Берём только аудиотрек (главный фикс)
-  const aTracks = display.getAudioTracks();
+  // 2) только аудио-трек
+  const aTracks=display.getAudioTracks();
   if(!aTracks || aTracks.length===0){
-    alert('В потоке нет аудио. Выбери "Chrome Tab" и включи "Share tab audio".');
+    alert('Нет аудио! Выбери "Chrome Tab" и включи "Share tab audio".');
     display.getTracks().forEach(t=>t.stop());
     return;
   }
-  const audioTrack = aTracks[0];
-  const audioStream = new MediaStream([audioTrack]);
-
-  // если пользователь завершит шаринг — остановимся
+  const audioStream = new MediaStream([aTracks[0]]);
   display.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => stopStudent()));
 
-  sFull=""; sLast="";
-  studentOut.textContent="Capturing Student Tab…";
-
-  // 3) Инициализируем MediaRecorder на ЧИСТОМ аудиопотоке
-  const mime = pickMime();
-  try{
-    mediaRec = new MediaRecorder(audioStream, mime ? { mimeType: mime } : {});
-  }catch(e){
-    console.warn('MediaRecorder init failed', e);
-    alert('Не удалось инициализировать запись аудио вкладки. Обнови Chrome и повтори.');
-    display.getTracks().forEach(t=>t.stop());
-    return;
-  }
+  sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
+  const mime=pickMime();
+  try{ mediaRec=new MediaRecorder(audioStream, mime?{mimeType:mime}:{}) }
+  catch(e){ console.warn('Recorder init fail',e); alert('Не удалось инициализировать запись аудио вкладки.'); display.getTracks().forEach(t=>t.stop()); return; }
 
   mediaRec.ondataavailable = async (ev) => {
     if(!ev.data || ev.data.size < 1000) return;
+    lastChunkTs = Date.now();
     try{
       const buf = await ev.data.arrayBuffer();
       const b64 = arrayBufferToBase64(buf);
@@ -193,40 +197,48 @@ async function startStudent(){
       if(text){
         sFull += (sFull ? ' ' : '') + text;
         studentOut.textContent = sFull;
-        const st = tail(sFull);
-        if(st && st !== sLast){ sLast = st; requestHints(); }
+        const st = tail(sFull); if(st && st !== sLast){ sLast = st; requestHints(); }
+        clearAfterPause('s');
       }
     }catch(err){ console.warn('STT error', err); }
   };
 
-  mediaRec.onerror = (e) => console.warn('MediaRecorder error', e);
+  mediaRec.onerror=(e)=>console.warn('MediaRecorder error',e);
 
-  try{
-    mediaRec.start(CHUNK_MS);
-  }catch(e){
-    console.warn('MediaRecorder start failed', e);
-    alert('Не удалось начать запись. Выбери "Chrome Tab" и включи "Share tab audio", затем попробуй снова.');
-    display.getTracks().forEach(t=>t.stop());
-    return;
+  try{ mediaRec.start(CHUNK_MS); }catch(e){
+    console.warn('start failed',e); alert('Не удалось начать запись. Включи "Share tab audio" и попробуй снова.');
+    display.getTracks().forEach(t=>t.stop()); return;
   }
 
-  // сохраним поток, чтобы корректно останавливать
+  // пульс и watchdog
+  lastChunkTs = Date.now();
+  studentPulse = setInterval(()=>{ try{ mediaRec && mediaRec.state==='recording' && mediaRec.requestData(); }catch{} }, CHUNK_MS);
+  studentWatchdog = setInterval(()=>{
+    if(Date.now() - lastChunkTs > 6000){ // 6с тишины — перезапуск
+      try{ mediaRec && mediaRec.stop(); }catch{}
+      try{ mediaRec.start(CHUNK_MS); lastChunkTs = Date.now(); }catch(e){ console.warn('watchdog restart fail', e); }
+    }
+  }, 2000);
+
   tabStream = display;
   document.getElementById('tabBtn').disabled=true;
   document.getElementById('stopStudent').disabled=false;
   statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
+  clearAfterPause('s');
 }
 
 function stopStudent(){
   try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{}
   mediaRec = null;
+  clearInterval(studentPulse); studentPulse=null;
+  clearInterval(studentWatchdog); studentWatchdog=null;
   if(tabStream){ try{ tabStream.getTracks().forEach(t=>t.stop()); }catch{} tabStream=null; }
   document.getElementById('tabBtn').disabled=false;
   document.getElementById('stopStudent').disabled=true;
   statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
 }
 
-/* ====== AI Hints ====== */
+/* ====== AI Hints (с защитой от пустых) ====== */
 let busy=false;
 async function requestHints(){
   if(busy) return; busy=true;
@@ -237,12 +249,19 @@ async function requestHints(){
       body: JSON.stringify({ teacher: tFull, student: sFull })
     });
     const d = await r.json();
-    if(d?.card) prependCard(d.card);
+    if(d?.card) prependCard(d.card); // сервер уже фильтрует пустые
   }catch(e){ console.warn(e); }
   busy=false;
 }
 
 function prependCard(card){
+  // локальная проверка на случай «вдруг»
+  const hasContent =
+    (card.errors && card.errors.length) ||
+    (card.definitions && card.definitions.length) ||
+    (card.synonyms && card.synonyms.length);
+  if (!hasContent) return;
+
   const div=document.createElement('div'); div.className='entry';
   div.innerHTML=`
     <div class="cols">
@@ -272,7 +291,7 @@ function prependCard(card){
   while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-/* ====== Quick test → в учителя ====== */
+/* ====== Quick test → добавляет в учителя ====== */
 document.getElementById('sendManual').onclick = async () => {
   const el = document.getElementById('manualText');
   const t = el.value.trim(); if(!t) return;
@@ -280,20 +299,14 @@ document.getElementById('sendManual').onclick = async () => {
   teacherOut.textContent = tFull;
   const tt = tail(tFull); if(tt && tt !== tLast){ tLast = tt; requestHints(); }
   el.value = '';
+  clearAfterPause('t');
 };
 
-/* ====== Bind кнопок ====== */
+/* ====== Bind ====== */
 document.getElementById('micBtn').onclick = startTeacher;
 document.getElementById('stopTeacher').onclick = stopTeacher;
 document.getElementById('tabBtn').onclick = startStudent;
 document.getElementById('stopStudent').onclick = stopStudent;
-
-/* utils */
-function arrayBufferToBase64(buffer){
-  let binary=''; const bytes=new Uint8Array(buffer);
-  for(let i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
 </script>
 </body>
 </html>
