@@ -17,7 +17,7 @@ app.use(express.static(path.join(__dirname, "..", "client")));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// -------- STT (student) ----------
+// ---------- Speech-to-Text (Student) ----------
 app.post("/api/stt_student", async (req, res) => {
   try {
     const { audioBase64, mime } = req.body || {};
@@ -33,7 +33,7 @@ app.post("/api/stt_student", async (req, res) => {
     try {
       const r = await openai.audio.transcriptions.create({
         file,
-        model: "gpt-4o-mini-transcribe",
+        model: "gpt-4o-mini-transcribe", // быстрый STT
         language: "en",
       });
       text = (r?.text || "").trim();
@@ -53,7 +53,7 @@ app.post("/api/stt_student", async (req, res) => {
   }
 });
 
-// -------- Hints (3 колонки) ----------
+// ---------- Hints (3 columns) ----------
 app.post("/api/hints", async (req, res) => {
   try {
     const { teacher = "", student = "" } = req.body || {};
@@ -71,7 +71,7 @@ Keep it short. Use simple English. Pick a few relevant nouns/verbs/adjectives.
 Input: """${input}"""`;
 
     const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // быстрые подсказки
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
       response_format: { type: "json_object" },
@@ -91,7 +91,7 @@ Input: """${input}"""`;
   }
 });
 
-// SPA
+// ---------- SPA ----------
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
