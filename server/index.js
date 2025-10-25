@@ -1,125 +1,104 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import fs from 'node:fs';
-import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { OpenAI } from 'openai';
+// server/index.js
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+
+// OpenAI SDK (>= v4)
+import OpenAI from "openai";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '25mb' }));
 
+// ⬇️ КРИТИЧНО: поднимаем лимиты тела запроса (иначе 413 / обрыв больших аудио)
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// статика
+app.use(express.static(path.join(__dirname, "..", "client")));
+
+// OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const PORT = process.env.PORT || 8080;
 
-function lastTail(text, maxWords = 15) {
-  const words = (text || '').trim().split(/\s+/);
-  return words.slice(-maxWords).join(' ');
-}
-
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-// ---------- AI hints (teacher + student, короткий хвост) ----------
-app.post('/api/hints', async (req, res) => {
-  try {
-    const teacher = (req.body?.teacher || '').trim();
-    const student = (req.body?.student || '').trim();
-    const mix = [teacher, student].filter(Boolean).join('  ');
-    if (!mix) return res.json({ card: null });
-
-    const focus = lastTail(mix, 15);
-
-    let card = { errors: [], definitions: [], synonyms: [] };
-    try {
-      const resp = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.1,
-        max_tokens: 260,
-        messages: [
-          { role: 'system', content: 'Return ONLY valid JSON. No markdown.' },
-          {
-            role: 'user',
-            content: `
-You are an assistant for an English teacher. Analyze ONLY this short tail:
-"${focus}"
-
-Return STRICT JSON (no prose, no markdown). At least ONE section MUST be non-empty:
-{
-  "errors": [
-    {"title":"...","wrong":"...","fix":"...","explanation":"..."}
-  ],
-  "definitions": [
-    {"word":"...","pos":"noun|verb|adj","simple_def":"..."}
-  ],
-  "synonyms": [
-    {"word":"...","pos":"noun|verb|adj","list":["...","..."]}
-  ]
-}
-
-If there are no mistakes, provide 1–2 simple definitions and one synonyms item from the utterance.
-`
-          }
-        ]
-      });
-      const raw = resp.choices?.[0]?.message?.content?.trim() || '{}';
-      const parsed = JSON.parse(raw);
-      card.errors = Array.isArray(parsed.errors) ? parsed.errors : [];
-      card.definitions = Array.isArray(parsed.definitions) ? parsed.definitions : [];
-      card.synonyms = Array.isArray(parsed.synonyms) ? parsed.synonyms : [];
-    } catch (e) {
-      console.error('LLM error:', e.message);
-    }
-
-    // фильтр пустых карточек
-    const empty =
-      (!card.errors || card.errors.length === 0) &&
-      (!card.definitions || card.definitions.length === 0) &&
-      (!card.synonyms || card.synonyms.length === 0);
-
-    if (empty) return res.json({ card: null, focus });
-
-    res.json({ card, focus });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// ---------- Whisper STT для студента (звук вкладки) ----------
-app.post('/api/stt_student', async (req, res) => {
+// ====== STT студента (Whisper) ======
+app.post("/api/stt_student", async (req, res) => {
   try {
     const { audioBase64 } = req.body || {};
-    if (!audioBase64) return res.status(400).json({ text: '' });
+    if (!audioBase64) return res.status(400).json({ error: "no audio" });
 
-    const buf = Buffer.from(audioBase64, 'base64');
-    const tmp = path.join('/tmp', `${randomUUID()}.webm`);
-    fs.writeFileSync(tmp, buf);
+    // Преобразуем base64 → буфер
+    const buf = Buffer.from(audioBase64, "base64");
 
-    let text = '';
-    try {
-      const stream = fs.createReadStream(tmp);
-      const tr = await openai.audio.transcriptions.create({
-        file: stream,
-        model: 'whisper-1'
-      });
-      text = (tr?.text || '').trim();
-    } catch (e) {
-      console.error('Whisper error:', e.message);
-    } finally {
-      try { fs.unlinkSync(tmp); } catch {}
-    }
+    // Отправляем в /audio/transcriptions
+    // Используем "whisper-1" или "gpt-4o-mini-transcribe" (если доступна)
+    const result = await openai.audio.transcriptions.create({
+      file: new File([buf], "chunk.webm", { type: "audio/webm" }),
+      model: "whisper-1", // можно "gpt-4o-mini-transcribe" при наличии
+      // language: "en", // при желании фиксировать язык
+    });
 
+    const text = (result?.text || "").trim();
     res.json({ text });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ text: '' });
+  } catch (err) {
+    console.error("stt_student error:", err?.response?.data || err.message);
+    const code = err?.status || 500;
+    res.status(code).send(err?.message || "STT error");
   }
 });
 
-app.use(express.static('client'));
-app.get('/', (_req, res) => res.redirect('/teacher.html'));
+// ====== Подсказки для учителя ======
+app.post("/api/hints", async (req, res) => {
+  try {
+    const { teacher = "", student = "" } = req.body || {};
+    const input = (teacher + " " + student).trim();
+    if (!input) return res.json({ card: null });
 
+    // Просим модель выдать структуру (ошибки, дефиниции, синонимы)
+    const prompt = `
+You are a concise English-teaching assistant. From the input text, produce a JSON with:
+{
+  "errors": [{"title": "...", "wrong": "...", "fix": "...", "explanation": "..."}],
+  "definitions": [{"word": "...", "pos": "noun|verb|adj", "simple_def": "..."}],
+  "synonyms": [{"word": "...", "pos": "noun|verb|adj", "list": ["...","..."]}]
+}
+- Keep it short and simple.
+- Only include a few most relevant nouns/verbs/adjectives.
+- If no content for a section, return an empty array for it.
+Input: """${input}"""`;
+
+    const chat = await openai.chat.completions.create({
+      model: "gpt-4o-mini", // быстро и недорого; можно сменить при желании
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    });
+
+    let payload = {};
+    try {
+      payload = JSON.parse(chat.choices?.[0]?.message?.content || "{}");
+    } catch {}
+
+    const card = {
+      errors: Array.isArray(payload.errors) ? payload.errors : [],
+      definitions: Array.isArray(payload.definitions) ? payload.definitions : [],
+      synonyms: Array.isArray(payload.synonyms) ? payload.synonyms : [],
+    };
+
+    res.json({ card });
+  } catch (err) {
+    console.error("hints error:", err?.response?.data || err.message);
+    res.status(500).json({ card: null });
+  }
+});
+
+// fallback на страницу
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
+});
+
+// порт (Render использует PORT)
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Ready → http://localhost:${PORT}/teacher.html`);
+  console.log(`Teacher-only AI Tutor running: http://localhost:${PORT}/teacher.html`);
 });
