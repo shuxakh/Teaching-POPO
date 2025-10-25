@@ -45,7 +45,7 @@ Return STRICT JSON with three arrays (always present):
       "title": "Missing article | Grammar mistake | etc.",
       "wrong": "short incorrect fragment",
       "fix": "corrected fragment",
-      "explanation": "A2-level reason (<=200 chars)"
+      "explanation": "A2-level reason (<=300 chars)"
     }
   ],
   "definitions": [
