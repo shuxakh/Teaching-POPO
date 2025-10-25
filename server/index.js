@@ -20,7 +20,7 @@ function lastTail(text, maxWords = 15) {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-// --- AI hints (общие подсказки по хвосту teacher+student) ---
+// ---------- AI hints (teacher + student, короткий хвост) ----------
 app.post('/api/hints', async (req, res) => {
   try {
     const teacher = (req.body?.teacher || '').trim();
@@ -30,11 +30,21 @@ app.post('/api/hints', async (req, res) => {
 
     const focus = lastTail(mix, 15);
 
-    const prompt = `
+    let card = { errors: [], definitions: [], synonyms: [] };
+    try {
+      const resp = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        max_tokens: 260,
+        messages: [
+          { role: 'system', content: 'Return ONLY valid JSON. No markdown.' },
+          {
+            role: 'user',
+            content: `
 You are an assistant for an English teacher. Analyze ONLY this short tail:
 "${focus}"
 
-Return STRICT JSON:
+Return STRICT JSON (no prose, no markdown). At least ONE section MUST be non-empty:
 {
   "errors": [
     {"title":"...","wrong":"...","fix":"...","explanation":"..."}
@@ -45,18 +55,11 @@ Return STRICT JSON:
   "synonyms": [
     {"word":"...","pos":"noun|verb|adj","list":["...","..."]}
   ]
-}`;
+}
 
-    let card = { errors: [], definitions: [], synonyms: [] };
-
-    try {
-      const resp = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.1,
-        max_tokens: 260,
-        messages: [
-          { role: 'system', content: 'Return ONLY valid JSON. No markdown.' },
-          { role: 'user', content: prompt }
+If there are no mistakes, provide 1–2 simple definitions and one synonyms item from the utterance.
+`
+          }
         ]
       });
       const raw = resp.choices?.[0]?.message?.content?.trim() || '{}';
@@ -68,6 +71,14 @@ Return STRICT JSON:
       console.error('LLM error:', e.message);
     }
 
+    // фильтр пустых карточек
+    const empty =
+      (!card.errors || card.errors.length === 0) &&
+      (!card.definitions || card.definitions.length === 0) &&
+      (!card.synonyms || card.synonyms.length === 0);
+
+    if (empty) return res.json({ card: null, focus });
+
     res.json({ card, focus });
   } catch (err) {
     console.error(err);
@@ -75,7 +86,7 @@ Return STRICT JSON:
   }
 });
 
-// --- Whisper STT для студента (звук вкладки) ---
+// ---------- Whisper STT для студента (звук вкладки) ----------
 app.post('/api/stt_student', async (req, res) => {
   try {
     const { audioBase64 } = req.body || {};
@@ -87,9 +98,9 @@ app.post('/api/stt_student', async (req, res) => {
 
     let text = '';
     try {
-      const f = fs.createReadStream(tmp);
+      const stream = fs.createReadStream(tmp);
       const tr = await openai.audio.transcriptions.create({
-        file: f,
+        file: stream,
         model: 'whisper-1'
       });
       text = (tr?.text || '').trim();
