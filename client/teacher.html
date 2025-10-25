@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Teacher — AI Hints (FAST Recorder + WebM→WAV fallback)</title>
+  <title>Teacher — AI Hints (FAST Recorder → WAV)</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#fafbff}
     .wrap{max-width:1200px;margin:0 auto}
@@ -56,7 +56,7 @@
       </div>
       <div class="row" style="margin-top:6px">
         <input type="checkbox" id="fastMode" checked>
-        <label for="fastMode" class="small">Fast mode (Opus/WebM chunks ~0.8–1.0s)</label>
+        <label for="fastMode" class="small">Fast mode (Opus chunks ~0.9s → WAV upload)</label>
       </div>
       <p class="note" style="margin-top:6px">
         В диалоге Chrome выбери <b>Chrome Tab</b> и включи <b>Share tab audio</b>.
@@ -132,7 +132,7 @@ const diagEl=document.getElementById('diag');
 
 function now(){return new Date().toLocaleTimeString();}
 function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
-function updateDiag(extra={}){
+function updateDiag(extra={}) {
   diagEl.innerHTML=`
 time: ${now()}<br>
 VAD: ema=${ema.toFixed(3)} • speech=${speechActive?'ON':'off'} • lastSpeechMs=${lastSpeechMs}<br>
@@ -180,7 +180,7 @@ function stopTeacher(){
   if(!speechActive) statusEl.textContent='idle';
 }
 
-/* ====== WAV helpers ====== */
+/* ====== Helpers ====== */
 function floatTo16BitPCM(input){
   const out=new Int16Array(input.length);
   for(let i=0;i<input.length;i++){let s=Math.max(-1,Math.min(1,input[i]));out[i]=s<0?s*0x8000:s*0x7FFF;}
@@ -208,16 +208,13 @@ function u8ToBase64(u8){
   } return btoa(binary);
 }
 
-/* ====== Transcode: WebM/Opus → WAV (моно) ====== */
-async function transcodeWebmToWav(webmBlob){
-  const ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 48000*10, 48000); // запас до 10s
-  const buf = await webmBlob.arrayBuffer();
-  // decode с обычным AudioContext надёжнее в браузерах
+/* --- WebM(Opus) → WAV (моно) --- */
+async function webmToWav(webmBlob){
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await webmBlob.arrayBuffer();
   const audioBuf = await ctx.decodeAudioData(buf);
   try{ ctx.close(); }catch{}
   const ch0 = audioBuf.getChannelData(0);
-  // если есть 2й канал — усредняем
   let mono = ch0;
   if (audioBuf.numberOfChannels > 1){
     const ch1 = audioBuf.getChannelData(1);
@@ -227,38 +224,21 @@ async function transcodeWebmToWav(webmBlob){
   return encodeWAV(mono, audioBuf.sampleRate || 48000);
 }
 
-/* ====== Upload helper (любой Blob, с авто-фолбэком на WAV) ====== */
-async function sendToSTT(b64, mime){
-  return fetch('/api/stt_student',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({audioBase64:b64, mime})
-  });
-}
-
-async function uploadBlob(blob, mime){
-  sttBusy=true; flushes++; lastFlushAt=now();
-  updateDiag({msg:`flush size=${blob.size} (${mime})`});
-
-  // 1) Пробуем как есть
+/* --- Upload WAV --- */
+async function uploadWavBlob(wavBlob){
+  sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush size=${wavBlob.size} (audio/wav)`});
   try{
-    const buf=await blob.arrayBuffer();
-    const b64=u8ToBase64(new Uint8Array(buf));
-    let r = await sendToSTT(b64, mime);
-
-    // 2) Если сервер вернул 400 на webm — автоматический транскод в WAV и повтор
-    if (r.status === 400 && mime !== 'audio/wav'){
-      updateDiag({msg:`400 on ${mime} → transcoding to WAV...`});
-      const wav = await transcodeWebmToWav(blob);
-      const buf2 = await wav.arrayBuffer();
-      const b64wav = u8ToBase64(new Uint8Array(buf2));
-      r = await sendToSTT(b64wav, 'audio/wav');
-    }
-
+    const b = await wavBlob.arrayBuffer();
+    const b64 = u8ToBase64(new Uint8Array(b));
+    const r = await fetch('/api/stt_student',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({audioBase64:b64, mime:'audio/wav'})
+    });
     if(!r.ok){
       const t=await r.text().catch(()=> '');
       updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`});
-    } else {
+    }else{
       const d=await r.json().catch(()=> ({}));
       const text=(d?.text||'').trim();
       if(text){
@@ -266,15 +246,14 @@ async function uploadBlob(blob, mime){
         const st=tail(sFull); if(st && st!==sLast){ sLast=st; requestHints(); }
         clearTimeout(sPauseTimer);
         sPauseTimer=setTimeout(()=>{ sFull=''; sLast=''; studentOut.textContent='—'; }, PAUSE_MS);
-      } else {
+      }else{
         updateDiag({msg:'STT ok, but empty text'});
       }
     }
   }catch(e){
     updateDiag({msg:`upload error: ${e.message}`});
   }finally{
-    sttBusy=false;
-    updateDiag();
+    sttBusy=false; updateDiag();
   }
 }
 
@@ -282,7 +261,7 @@ async function uploadBlob(blob, mime){
 async function uploadChunk(samples){
   if(!samples || samples.length===0) return;
   const wav=encodeWAV(samples,sampleRate);
-  await uploadBlob(wav,'audio/wav');
+  await uploadWavBlob(wav);
 }
 function manualFlush(){
   if(pcmLen===0) return;
@@ -291,7 +270,25 @@ function manualFlush(){
   uploadChunk(samples);
 }
 
-/* ====== START Student: FAST (MediaRecorder) ИЛИ fallback (VAD) ====== */
+/* ====== START Student ====== */
+const REC_QUEUE = []; // очередь Blob-ов
+let REC_BUSY=false;
+
+async function processQueue(){
+  if(REC_BUSY) return;
+  REC_BUSY=true;
+  while(REC_QUEUE.length){
+    const blob = REC_QUEUE.shift();
+    try{
+      const wav = await webmToWav(blob);   // конверсия на клиенте
+      await uploadWavBlob(wav);            // и только WAV на сервер
+    }catch(e){
+      updateDiag({msg:`convert/upload failed: ${e.message}`});
+    }
+  }
+  REC_BUSY=false;
+}
+
 async function startStudent(){
   try{
     displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
@@ -316,17 +313,15 @@ async function startStudent(){
 
   if (wantFast){
     try{
-      recorder = new MediaRecorder(srcStream, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 32000
-      });
+      recorder = new MediaRecorder(srcStream, { mimeType:'audio/webm;codecs=opus', audioBitsPerSecond:32000 });
       recorder.ondataavailable = (ev)=>{
-        if (ev.data && ev.data.size>0 && !sttBusy){
-          uploadBlob(ev.data, 'audio/webm'); // при 400 сам перекодирует в WAV
+        if (ev.data && ev.data.size>0){
+          REC_QUEUE.push(ev.data);
+          processQueue();
         }
       };
       recorder.start(RECORDER_TIMESLICE);
-      updateDiag({msg:'FAST mode (MediaRecorder) started'});
+      updateDiag({msg:'FAST mode started (record WebM→convert to WAV)'});
     }catch(e){
       updateDiag({msg:`FAST mode failed, fallback: ${e.message}`});
       await startStudentFallbackVAD();
@@ -366,7 +361,7 @@ async function startStudentFallbackVAD(){
     const ch1=e.inputBuffer.numberOfChannels>1?e.inputBuffer.getChannelData(1):null;
     const N=ch0.length;
     const mono=new Float32Array(N);
-    if(ch1){ for(let i=0;i<N;i++) mono[i]=(ch0[i]+ch1[i])*0.5; } else mono.set(ch0);
+    if(ch1){ for(let i=0;i<N;i++) mono[i]=(ch0[i]+ch1[i]) * 0.5; } else mono.set(ch0);
 
     let sum=0; for(let i=0;i<N;i++){const v=mono[i]; sum+=v*v;}
     const instRMS=Math.sqrt(sum/N);
@@ -410,6 +405,7 @@ async function startStudentFallbackVAD(){
 function stopStudent(){
   try{ const sinkEl=document.getElementById('tabAudioSink'); sinkEl.pause(); sinkEl.srcObject=null; }catch{}
   if(recorder){ try{ recorder.stop(); }catch{} recorder=null; }
+  REC_QUEUE.length = 0;
   try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
   try{ analyser && analyser.disconnect(); }catch{} analyser=null;
   try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
