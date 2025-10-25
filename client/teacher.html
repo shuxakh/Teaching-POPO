@@ -1,4 +1,4 @@
-\<!doctype html>
+<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
@@ -36,7 +36,7 @@
 </head>
 <body>
 
-<!-- 🔊 скрытый приёмник аудио вкладки -->
+<!-- приемник звука вкладки, чтобы Chrome не “глушил” аудио -->
 <audio id="tabAudioSink" autoplay muted playsinline style="display:none"></audio>
 
 <div class="wrap">
@@ -93,7 +93,7 @@
 </div>
 
 <script>
-/*** ------- общие ------- ***/
+/* ====== STATE ====== */
 let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
 let displayStream=null, srcStream=null;
 let audioCtx=null, sourceNode=null, gainNode=null, analyser=null, scriptNode=null;
@@ -106,7 +106,7 @@ let pcmBuffers=[], pcmLen=0;
 let sttBusy=false, flushes=0, lastFlushAt='—', rms=0, ema=0, procCalls=0;
 let uttSamples=0, speechActive=false, lastSpeechMs=0;
 
-// VAD параметры
+/* ====== VAD ====== */
 const EMA_ALPHA = 0.15;
 const VAD_ENTER = 0.025;
 const VAD_EXIT  = 0.015;
@@ -115,6 +115,7 @@ const SILENCE_MS = 900;
 const MAX_UTT_MS = 6000;
 const GAIN = 3.0;
 
+/* ====== UI ====== */
 const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
 const studentOut=document.getElementById('studentOut');
@@ -134,56 +135,90 @@ ${extra.msg?('<span class="warn">'+extra.msg+'</span>'):''}
   document.getElementById('forceFlush').onclick=()=>manualFlush();
 }
 
-/*** ------- Teacher SR ------- ***/
+/* ====== TEACHER MIC (SR) ====== */
 function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
   SR=new S(); SR.lang='en-US'; SR.interimResults=true; SR.continuous=true;
   SR.onresult=e=>{
-    let interim=''; for(let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i];
-      if(r.isFinal){ const piece=r[0].transcript.trim(); if(!piece) continue;
+    let interim='';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const r=e.results[i];
+      if(r.isFinal){
+        const piece=r[0].transcript.trim(); if(!piece) continue;
         tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
         const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
-        clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=""; tLast=""; teacherOut.textContent="—"; }, PAUSE_MS);
-      } else { interim+=r[0].transcript; }
+        clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=''; tLast=''; teacherOut.textContent='—'; }, PAUSE_MS);
+      }else interim+=r[0].transcript;
     }
     if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
-  SR.onerror=()=>{}; SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
+  SR.onerror=()=>{};
+  SR.onend=()=>{ if(keepTeacher){ try{ SR.start(); }catch{} } };
 }
 async function startTeacher(){
   if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
   if(!SR) initSR(); try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
   tFull=""; tLast=""; teacherOut.textContent="Listening (Teacher Mic)…";
-  keepTeacher=true; SR.start(); document.getElementById('micBtn').disabled=true; document.getElementById('stopTeacher').disabled=false;
+  keepTeacher=true; SR.start();
+  document.getElementById('micBtn').disabled=true;
+  document.getElementById('stopTeacher').disabled=false;
   statusEl.textContent='listening (teacher)';
 }
 function stopTeacher(){
   keepTeacher=false; try{ SR && SR.stop(); }catch{}
-  document.getElementById('micBtn').disabled=false; document.getElementById('stopTeacher').disabled=true;
+  document.getElementById('micBtn').disabled=false;
+  document.getElementById('stopTeacher').disabled=true;
   if(!speechActive) statusEl.textContent='idle';
 }
 
-/*** ------- WAV helpers ------- **/
-function floatTo16BitPCM(input){const out=new Int16Array(input.length);for(let i=0;i<input.length;i++){let s=Math.max(-1,Math.min(1,input[i]));out[i]=s<0?s*0x8000:s*0x7FFF;}return out;}
-function encodeWAV(samples,sr){const b=new ArrayBuffer(44+samples.length*2);const v=new DataView(b);function ws(o,s){for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}ws(0,'RIFF');v.setUint32(4,36+samples.length*2,true);ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,'data');v.setUint32(40,samples.length*2,true);new Int16Array(b,44).set(floatTo16BitPCM(samples));return new Blob([b],{type:'audio/wav'});}
-function mergeFloat32(bufs,total){const r=new Float32Array(total);let o=0;for(const b of bufs){r.set(b,o);o+=b.length;}return r;}
+/* ====== WAV helpers ====== */
+function floatTo16BitPCM(input){
+  const out=new Int16Array(input.length);
+  for(let i=0;i<input.length;i++){let s=Math.max(-1,Math.min(1,input[i]));out[i]=s<0?s*0x8000:s*0x7FFF;}
+  return out;
+}
+function encodeWAV(samples,sr){
+  const b=new ArrayBuffer(44+samples.length*2);
+  const v=new DataView(b);
+  function ws(o,s){for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}
+  ws(0,'RIFF');v.setUint32(4,36+samples.length*2,true);
+  ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);
+  v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true);v.setUint16(34,16,true);
+  ws(36,'data');v.setUint32(40,samples.length*2,true);
+  new Int16Array(b,44).set(floatTo16BitPCM(samples));
+  return new Blob([b],{type:'audio/wav'});
+}
+function mergeFloat32(bufs,total){
+  const r=new Float32Array(total); let o=0; for(const b of bufs){r.set(b,o);o+=b.length;} return r;
+}
+function u8ToBase64(u8){
+  const CHUNK=0x8000; let binary=''; for(let i=0;i<u8.length;i+=CHUNK){
+    binary+=String.fromCharCode.apply(null,u8.subarray(i,i+CHUNK));
+  } return btoa(binary);
+}
 
-/*** ------- Upload (БЕЗ рекурсии) ------- **/
+/* ====== Upload (без рекурсии) ====== */
 async function uploadChunk(samples){
   if(!samples || samples.length===0) return;
 
   const wav=encodeWAV(samples,sampleRate);
   const buf=await wav.arrayBuffer();
-  const b64=btoa(String.fromCharCode(...new Uint8Array(buf)));
+  const b64=u8ToBase64(new Uint8Array(buf));
 
   sttBusy=true; flushes++; lastFlushAt=now(); updateDiag({msg:`flush size=${wav.size}`});
   try{
-    const r=await fetch('/api/stt_student',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audioBase64:b64,mime:'audio/wav'})});
+    const r=await fetch('/api/stt_student',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({audioBase64:b64,mime:'audio/wav'})
+    });
     if(!r.ok){
       const t=await r.text().catch(()=> ''); updateDiag({msg:`/api/stt_student ${r.status} ${r.statusText} ${t.slice(0,200)}`});
     }else{
-      const d=await r.json().catch(()=> ({})); const text=(d?.text||'').trim();
+      const d=await r.json().catch(()=> ({}));
+      const text=(d?.text||'').trim();
       if(text){
         sFull+=(sFull?' ':'')+text; studentOut.textContent=sFull;
         const st=tail(sFull); if(st && st!==sLast){ sLast=st; requestHints(); }
@@ -193,88 +228,90 @@ async function uploadChunk(samples){
   }catch(e){ updateDiag({msg:`upload error: ${e.message}`}); }
   finally{
     sttBusy=false;
+    // жёсткая очистка буферов, чтобы не зациклиться
     pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
     updateDiag();
   }
 }
-function manualFlush(){ if(pcmLen===0) return; const samples=mergeFloat32(pcmBuffers,pcmLen); pcmBuffers=[]; pcmLen=0; uttSamples=0; uploadChunk(samples); }
+function manualFlush(){
+  if(pcmLen===0) return;
+  const samples=mergeFloat32(pcmBuffers,pcmLen);
+  pcmBuffers=[]; pcmLen=0; uttSamples=0;
+  uploadChunk(samples);
+}
 
-/*** ------- Student start (sink + VAD) ------- **/
+/* ====== Student tab capture + VAD ====== */
 async function startStudent(){
-  try {
-    displayStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
-  } catch {
-    alert('Выбор вкладки отменён'); 
-    return;
+  try{
+    displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
+  }catch{
+    alert('Выбор вкладки отменён'); return;
   }
-
-  const aTracks = displayStream.getAudioTracks();
-  if (!aTracks || !aTracks.length) {
+  const aTracks=displayStream.getAudioTracks();
+  if(!aTracks.length){
     alert('Нет аудио! Включи "Share tab audio".');
-    displayStream.getTracks().forEach(t => t.stop());
-    displayStream = null;
-    return;
+    displayStream.getTracks().forEach(t=>t.stop()); displayStream=null; return;
   }
 
-  const sinkEl = document.getElementById('tabAudioSink');
-  try {
-    sinkEl.srcObject = displayStream;
-    sinkEl.muted = true;
-    await sinkEl.play();
-  } catch (e) {
-    console.warn('tabAudioSink play() failed:', e);
-  }
+  // держим звуковой тракт "живым"
+  const sinkEl=document.getElementById('tabAudioSink');
+  try{ sinkEl.srcObject=displayStream; sinkEl.muted=true; await sinkEl.play(); }catch(e){ console.warn('tabAudioSink play() failed', e); }
 
-  const at = aTracks[0];
-  at.onmute   = () => updateDiag({msg:'audio track MUTED'});
-  at.onunmute = () => updateDiag({msg:'audio track UNMUTED'});
-  at.onended  = () => updateDiag({msg:'audio track ENDED'});
+  const at=aTracks[0];
+  at.onmute  =()=>updateDiag({msg:'audio track MUTED'});
+  at.onunmute=()=>updateDiag({msg:'audio track UNMUTED'});
+  at.onended =()=>updateDiag({msg:'audio track ENDED'});
+  srcStream=new MediaStream([at]);
 
-  srcStream = new MediaStream([at]);
-
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
   await audioCtx.resume();
-  sampleRate = audioCtx.sampleRate;
+  sampleRate=audioCtx.sampleRate;
 
-  sourceNode = audioCtx.createMediaStreamSource(srcStream);
-  gainNode   = audioCtx.createGain();  gainNode.gain.value = GAIN;
-  analyser   = audioCtx.createAnalyser(); analyser.fftSize = 512;
+  sourceNode=audioCtx.createMediaStreamSource(srcStream);
+  gainNode  =audioCtx.createGain();   gainNode.gain.value=GAIN;
+  analyser  =audioCtx.createAnalyser(); analyser.fftSize=512;
 
-  const BS = 4096;
-  scriptNode = audioCtx.createScriptProcessor(BS, 2, 2);
-  scriptNode.onaudioprocess = (e) => {
+  const BS=4096;
+  scriptNode=audioCtx.createScriptProcessor(BS,2,2);
+  scriptNode.onaudioprocess=(e)=>{
     procCalls++;
-    const ch0 = e.inputBuffer.getChannelData(0);
-    const ch1 = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : null;
-    const N = ch0.length;
-    const mono = new Float32Array(N);
-    if (ch1) { for (let i=0;i<N;i++) mono[i] = (ch0[i]+ch1[i]) * 0.5; }
-    else      { mono.set(ch0); }
+    const ch0=e.inputBuffer.getChannelData(0);
+    const ch1=e.inputBuffer.numberOfChannels>1?e.inputBuffer.getChannelData(1):null;
+    const N=ch0.length;
+    const mono=new Float32Array(N);
+    if(ch1){ for(let i=0;i<N;i++) mono[i]=(ch0[i]+ch1[i])*0.5; } else mono.set(ch0);
 
-    let sum=0; for (let i=0;i<N;i++){ const v=mono[i]; sum += v*v; }
-    const instRMS = Math.sqrt(sum/N);
-    ema = EMA_ALPHA*instRMS + (1-EMA_ALPHA)*ema; rms = instRMS;
+    // RMS + EMA
+    let sum=0; for(let i=0;i<N;i++){const v=mono[i]; sum+=v*v;}
+    const instRMS=Math.sqrt(sum/N);
+    ema=EMA_ALPHA*instRMS+(1-EMA_ALPHA)*ema; rms=instRMS;
 
-    const nowMs = performance.now();
-    if (!speechActive && ema >= VAD_ENTER) { speechActive = true; lastSpeechMs = nowMs; }
-    if (speechActive) {
-      lastSpeechMs = nowMs;
-      pcmBuffers.push(mono); pcmLen += N; uttSamples += N;
-      const uttMs = (uttSamples/sampleRate)*1000;
-      if (uttMs >= MAX_UTT_MS && !sttBusy) {
-        const samples = mergeFloat32(pcmBuffers, pcmLen);
+    const nowMs=performance.now();
+
+    // вход в речь
+    if(!speechActive && ema>=VAD_ENTER){ speechActive=true; lastSpeechMs=nowMs; }
+
+    if(speechActive){
+      lastSpeechMs=nowMs;
+      pcmBuffers.push(mono); pcmLen+=N; uttSamples+=N;
+
+      const uttMs=(uttSamples/sampleRate)*1000;
+      if(uttMs>=MAX_UTT_MS && !sttBusy){
+        const samples=mergeFloat32(pcmBuffers,pcmLen);
         pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
         uploadChunk(samples);
       }
     }
-    if (speechActive && ema < VAD_EXIT) {
-      if (nowMs - lastSpeechMs > SILENCE_MS && !sttBusy) {
-        const uttMs = (uttSamples/sampleRate)*1000;
-        if (uttMs >= MIN_UTT_MS) {
-          const samples = mergeFloat32(pcmBuffers, pcmLen);
+
+    // выход из речи
+    if(speechActive && ema<VAD_EXIT){
+      if(nowMs-lastSpeechMs>SILENCE_MS && !sttBusy){
+        const uttMs=(uttSamples/sampleRate)*1000;
+        if(uttMs>=MIN_UTT_MS){
+          const samples=mergeFloat32(pcmBuffers,pcmLen);
           pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
           uploadChunk(samples);
-        } else {
+        }else{
           pcmBuffers=[]; pcmLen=0; uttSamples=0; speechActive=false;
         }
       }
@@ -286,27 +323,25 @@ async function startStudent(){
   gainNode.connect(scriptNode);
   scriptNode.connect(audioCtx.destination);
 
-  displayStream.getVideoTracks().forEach(tr => tr.addEventListener('ended', stopStudent));
+  displayStream.getVideoTracks().forEach(tr=>tr.addEventListener('ended', stopStudent));
 
+  // reset
   sFull=""; sLast=""; studentOut.textContent="Capturing Student Tab…";
   flushes=0; lastFlushAt='—'; sttBusy=false; pcmBuffers=[]; pcmLen=0; procCalls=0; ema=0; speechActive=false; uttSamples=0;
 
-  document.getElementById('tabBtn').disabled = true;
-  document.getElementById('stopStudent').disabled = false;
-  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
+  document.getElementById('tabBtn').disabled=true;
+  document.getElementById('stopStudent').disabled=false;
+  statusEl.textContent=keepTeacher?'listening (teacher + student)':'listening (student)';
   updateDiag();
 
-  setTimeout(() => {
-    if (procCalls === 0) updateDiag({msg:'onaudioprocess не тикает — выбери именно "Chrome Tab" и включи Share tab audio, а на вкладке должен реально идти звук.'});
+  // если обработчик не запускается — подсказка
+  setTimeout(()=>{ if(procCalls===0)
+    updateDiag({msg:'onaudioprocess не тикает — выбери именно "Chrome Tab" и включи Share tab audio; на вкладке должен идти звук.'});
   }, 4000);
 }
 
 function stopStudent(){
-  try {
-    const sinkEl = document.getElementById('tabAudioSink');
-    if (sinkEl) { try { sinkEl.pause(); } catch {} sinkEl.srcObject = null; }
-  } catch {}
-
+  try{ const sinkEl=document.getElementById('tabAudioSink'); sinkEl.pause(); sinkEl.srcObject=null; }catch{}
   try{ scriptNode && scriptNode.disconnect(); }catch{} scriptNode=null;
   try{ analyser && analyser.disconnect(); }catch{} analyser=null;
   try{ gainNode && gainNode.disconnect(); }catch{} gainNode=null;
@@ -321,13 +356,17 @@ function stopStudent(){
   updateDiag({msg:'student stopped'});
 }
 
-/*** ------- hints ------- **/
+/* ====== HINTS ====== */
 let busy=false;
 async function requestHints(){
   if(busy) return; busy=true;
   try{
-    const r=await fetch('/api/hints',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teacher:tFull,student:sFull})});
-    const d=await r.json(); if(d?.card) prependCard(d.card);
+    const r=await fetch('/api/hints',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({teacher:tFull,student:sFull})
+    });
+    const d=await r.json().catch(()=>null);
+    if(d?.card) prependCard(d.card);
   }catch(e){ console.warn(e); }
   busy=false;
 }
@@ -341,19 +380,35 @@ function prependCard(card){
     <div class="col syn"><h4>Synonyms</h4><div class="syns"></div></div>
   </div>`;
   const eW=div.querySelector('.errors'), dW=div.querySelector('.defs'), sW=div.querySelector('.syns');
-  (card.errors||[]).forEach(e=>{ const el=document.createElement('div'); el.className='errItem'; el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`; eW.appendChild(el); });
-  (card.definitions||[]).forEach(x=>{ const el=document.createElement('div'); el.className='defItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`; dW.appendChild(el); });
-  (card.synonyms||[]).forEach(x=>{ const el=document.createElement('div'); el.className='synItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`; sW.appendChild(el); });
-  feed.prepend(div); while(feed.children.length>30) feed.removeChild(feed.lastChild);
+  (card.errors||[]).forEach(e=>{
+    const el=document.createElement('div'); el.className='errItem';
+    el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`;
+    eW.appendChild(el);
+  });
+  (card.definitions||[]).forEach(x=>{
+    const el=document.createElement('div'); el.className='defItem';
+    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`;
+    dW.appendChild(el);
+  });
+  (card.synonyms||[]).forEach(x=>{
+    const el=document.createElement('div'); el.className='synItem';
+    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`;
+    sW.appendChild(el);
+  });
+  feed.prepend(div);
+  while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-/*** ------- quick test ------- **/
-document.getElementById('sendManual').onclick=()=>{ const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
-  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull; const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); } el.value='';
+/* ====== Quick test ====== */
+document.getElementById('sendManual').onclick=()=>{
+  const el=document.getElementById('manualText'); const t=el.value.trim(); if(!t) return;
+  tFull=tFull?(tFull+' '+t):t; teacherOut.textContent=tFull;
+  const tt=tail(tFull); if(tt&&tt!==tLast){ tLast=tt; requestHints(); }
+  el.value='';
   clearTimeout(tPauseTimer); tPauseTimer=setTimeout(()=>{ tFull=''; tLast=''; teacherOut.textContent='—'; }, PAUSE_MS);
 };
 
-/*** ------- бинды ------- **/
+/* ====== BINDINGS ====== */
 document.getElementById('micBtn').onclick=startTeacher;
 document.getElementById('stopTeacher').onclick=stopTeacher;
 document.getElementById('tabBtn').onclick=startStudent;
