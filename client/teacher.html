@@ -3,20 +3,23 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Teaching POPO — AI Hints</title>
+  <title>Teacher — AI Hints</title>
   <style>
-    body{font-family:system-ui;margin:24px;background:#fafbff}
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif;margin:24px;background:#fafbff}
     .wrap{max-width:1200px;margin:0 auto}
     .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    button{padding:10px 14px;border-radius:10px;border:1px solid #ccc;cursor:pointer}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #ccc;background:#fff;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
     .card{background:#fff;padding:14px;border:1px solid #ddd;border-radius:12px;margin-bottom:12px}
     .live{background:#f5f6fb;border:1px solid #ddd;border-radius:10px;min-height:70px;padding:10px}
+    .topgrid{display:grid;grid-template-columns:1fr 320px;gap:12px;align-items:start}
+    @media(max-width:900px){.topgrid{grid-template-columns:1fr}}
     .twocol{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    @media(max-width:800px){.twocol{grid-template-columns:1fr}}
+    @media(max-width:900px){.twocol{grid-template-columns:1fr}}
     .feed{display:flex;flex-direction:column;gap:12px}
     .entry{background:#fff;border:1px solid #ddd;border-radius:12px;padding:10px}
     .cols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-    @media(max-width:800px){.cols{grid-template-columns:1fr}}
+    @media(max-width:900px){.cols{grid-template-columns:1fr}}
     .col{border:1px solid #ddd;border-radius:10px;padding:8px}
     .error{background:#ffe9d6;border-color:#ffb980}
     .def{background:#efe7ff;border-color:#c9b6ff}
@@ -25,159 +28,272 @@
     .errItem{background:#fff0e5;border:1px solid #ffc58a}
     .defItem{background:#f5f0ff;border:1px solid #c9b6ff}
     .synItem{background:#f0fff0;border:1px solid #b8e6b8}
+    .note{color:#666;font-size:.9rem}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Teacher Panel — Private AI Hints</h1>
 
-  <div class="card">
-    <div class="row">
-      <button id="micBtn">🎙️ Teacher Mic</button>
-      <button id="stopTeacher" disabled>⏹️</button>
-      <button id="tabBtn">🖥️ Student Tab</button>
-      <button id="stopStudent" disabled>⏹️</button>
+  <div class="topgrid">
+    <!-- Источники -->
+    <div class="card">
+      <div class="row">
+        <label><b>Teacher:</b></label>
+        <button id="micBtn">🎙️ Teacher Mic</button>
+        <button id="stopTeacher" disabled>⏹️ Stop</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label><b>Student:</b></label>
+        <button id="tabBtn">🖥️ Student Tab (with audio)</button>
+        <button id="stopStudent" disabled>⏹️ Stop</button>
+      </div>
+      <p class="note" style="margin-top:6px">
+        В диалоге Chrome выбери <b>Chrome Tab</b> и включи <b>Share tab audio</b>.
+        Если аудио не придёт, появится подсказка и запись не запустится.
+      </p>
     </div>
-    <p style="font-size:.9rem;color:#555">Выбери вкладку и включи “Share tab audio”. Если аудио нет — появится предупреждение.</p>
+
+    <!-- Quick test -->
+    <div class="card">
+      <h3 style="margin:0 0 8px">Quick test</h3>
+      <div class="row" style="gap:8px">
+        <input id="manualText" placeholder="Type a word or phrase…" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:10px">
+        <button id="sendManual">Send</button>
+      </div>
+      <p class="note" style="margin-top:8px">Добавляет текст в транскрипт учителя.</p>
+    </div>
   </div>
 
   <div class="twocol">
-    <div><h3>Teacher transcript</h3><div id="teacherOut" class="live">—</div></div>
-    <div><h3>Student transcript</h3><div id="studentOut" class="live">—</div></div>
+    <div>
+      <h3>Teacher transcript</h3>
+      <div id="teacherOut" class="live">—</div>
+    </div>
+    <div>
+      <h3>Student transcript</h3>
+      <div id="studentOut" class="live">—</div>
+    </div>
   </div>
 
-  <h3>AI hints (newest on top)</h3>
+  <h3 style="margin-top:16px">AI hints (newest on top)</h3>
   <div id="feed" class="feed"></div>
 
-  <p>Status: <span id="status">idle</span></p>
+  <p class="note">Status: <span id="status">idle</span></p>
 </div>
 
 <script>
-let SR, keepTeacher=false, tFull="",sFull="",tLast="",sLast="";
-let mediaRec=null, tabStream=null;
+/* ====== общие ====== */
+let SR, keepTeacher=false, tFull="", sFull="", tLast="", sLast="";
+let tabStream=null, mediaRec=null;
 const CHUNK_MS=1500;
+const statusEl=document.getElementById('status');
 const teacherOut=document.getElementById('teacherOut');
 const studentOut=document.getElementById('studentOut');
 const feed=document.getElementById('feed');
-const statusEl=document.getElementById('status');
 
-function tail(t,n=15){return(t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
-function supportsSR(){return'webkitSpeechRecognition'in window||'SpeechRecognition'in window;}
+function tail(t,n=15){return (t||"").trim().split(/\s+/).slice(-n).join(" ").toLowerCase();}
+function supportsSR(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 
+/* надёжный выбор mime */
 function pickMime(){
-  const m=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'];
-  for(const x of m){if(MediaRecorder.isTypeSupported?.(x))return x;}
+  const cand=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'];
+  for(const m of cand){ if(MediaRecorder.isTypeSupported?.(m)) return m; }
   return '';
 }
 
-// ========== TEACHER ==========
+/* ====== Teacher (SpeechRecognition) ====== */
 function initSR(){
   const S=window.SpeechRecognition||window.webkitSpeechRecognition;
-  SR=new S();SR.lang='en-US';SR.interimResults=true;SR.continuous=true;
+  SR=new S(); SR.lang='en-US'; SR.interimResults=true; SR.continuous=true;
+
   SR.onresult=async e=>{
     let interim='';
     for(let i=e.resultIndex;i<e.results.length;i++){
       const r=e.results[i];
       if(r.isFinal){
-        const piece=r[0].transcript.trim();if(!piece)continue;
-        tFull+=(tFull?' ':'')+piece;teacherOut.textContent=tFull;
-        const t=tail(tFull);if(t&&t!==tLast){tLast=t;requestHints();}
-      }else interim+=r[0].transcript;
+        const piece=r[0].transcript.trim(); if(!piece) continue;
+        tFull+=(tFull?' ':'')+piece; teacherOut.textContent=tFull;
+        const tt=tail(tFull); if(tt && tt!==tLast){ tLast=tt; requestHints(); }
+      } else {
+        interim+=r[0].transcript;
+      }
     }
-    if(interim)teacherOut.textContent=(tFull+' '+interim).trim();
+    if(interim) teacherOut.textContent=(tFull+' '+interim).trim();
   };
 }
+
 async function startTeacher(){
-  if(!supportsSR()){alert('Update Chrome.');return;}
-  if(!SR)initSR();
-  tFull="";tLast="";
-  try{await navigator.mediaDevices.getUserMedia({audio:true});}catch{}
-  keepTeacher=true;SR.start();
+  if(!supportsSR()){ alert('Update Chrome for SpeechRecognition API.'); return; }
+  if(!SR) initSR();
+  try{ await navigator.mediaDevices.getUserMedia({audio:true}); }catch{}
+  tFull=""; tLast="";
+  keepTeacher=true; SR.start();
   document.getElementById('micBtn').disabled=true;
   document.getElementById('stopTeacher').disabled=false;
-  statusEl.textContent='listening teacher';
+  statusEl.textContent='listening (teacher)';
 }
 function stopTeacher(){
-  keepTeacher=false;try{SR.stop();}catch{}
+  keepTeacher=false; try{ SR && SR.stop(); }catch{}
   document.getElementById('micBtn').disabled=false;
   document.getElementById('stopTeacher').disabled=true;
-  statusEl.textContent='idle';
+  if(!mediaRec) statusEl.textContent='idle';
 }
 
-// ========== STUDENT ==========
+/* ====== Student (tab audio → Whisper) ====== */
 async function startStudent(){
-  try{tabStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});}
-  catch{alert('Cancelled');return;}
-  const aTracks=tabStream.getAudioTracks();
-  if(!aTracks||aTracks.length===0){
-    alert('Нет аудио! Выбери Chrome Tab и включи "Share tab audio".');
-    tabStream.getTracks().forEach(t=>t.stop());tabStream=null;return;
+  // 1) Получаем поток с вкладки
+  let display;
+  try{
+    display = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true });
+  }catch{
+    alert('Выбор вкладки отменён.');
+    return;
   }
-  tabStream.getVideoTracks().forEach(tr=>tr.addEventListener('ended',()=>stopStudent()));
-  sFull="";sLast="";
+
+  // 2) Берём только аудиотрек (главный фикс)
+  const aTracks = display.getAudioTracks();
+  if(!aTracks || aTracks.length===0){
+    alert('В потоке нет аудио. Выбери "Chrome Tab" и включи "Share tab audio".');
+    display.getTracks().forEach(t=>t.stop());
+    return;
+  }
+  const audioTrack = aTracks[0];
+  const audioStream = new MediaStream([audioTrack]);
+
+  // если пользователь завершит шаринг — остановимся
+  display.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => stopStudent()));
+
+  sFull=""; sLast="";
   studentOut.textContent="Capturing Student Tab…";
-  const mime=pickMime();
-  try{mediaRec=new MediaRecorder(tabStream,mime?{mimeType:mime}:{})}
-  catch(e){alert('Recorder init fail '+e);stopStudent();return;}
-  mediaRec.ondataavailable=async ev=>{
-    if(!ev.data||ev.data.size<1000)return;
-    const buf=await ev.data.arrayBuffer();
-    const b64=arrayBufferToBase64(buf);
-    const r=await fetch('/api/stt_student',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audioBase64:b64})});
-    const d=await r.json();const text=(d.text||'').trim();
-    if(text){sFull+=(sFull?' ':'')+text;studentOut.textContent=sFull;
-      const t=tail(sFull);if(t&&t!==sLast){sLast=t;requestHints();}}
+
+  // 3) Инициализируем MediaRecorder на ЧИСТОМ аудиопотоке
+  const mime = pickMime();
+  try{
+    mediaRec = new MediaRecorder(audioStream, mime ? { mimeType: mime } : {});
+  }catch(e){
+    console.warn('MediaRecorder init failed', e);
+    alert('Не удалось инициализировать запись аудио вкладки. Обнови Chrome и повтори.');
+    display.getTracks().forEach(t=>t.stop());
+    return;
+  }
+
+  mediaRec.ondataavailable = async (ev) => {
+    if(!ev.data || ev.data.size < 1000) return;
+    try{
+      const buf = await ev.data.arrayBuffer();
+      const b64 = arrayBufferToBase64(buf);
+      const resp = await fetch('/api/stt_student', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ audioBase64: b64 })
+      });
+      const data = await resp.json();
+      const text = (data?.text || '').trim();
+      if(text){
+        sFull += (sFull ? ' ' : '') + text;
+        studentOut.textContent = sFull;
+        const st = tail(sFull);
+        if(st && st !== sLast){ sLast = st; requestHints(); }
+      }
+    }catch(err){ console.warn('STT error', err); }
   };
-  mediaRec.onerror=e=>console.warn('recorder err',e);
-  try{mediaRec.start(CHUNK_MS);}catch(e){alert('Не удалось начать запись');stopStudent();return;}
+
+  mediaRec.onerror = (e) => console.warn('MediaRecorder error', e);
+
+  try{
+    mediaRec.start(CHUNK_MS);
+  }catch(e){
+    console.warn('MediaRecorder start failed', e);
+    alert('Не удалось начать запись. Выбери "Chrome Tab" и включи "Share tab audio", затем попробуй снова.');
+    display.getTracks().forEach(t=>t.stop());
+    return;
+  }
+
+  // сохраним поток, чтобы корректно останавливать
+  tabStream = display;
   document.getElementById('tabBtn').disabled=true;
   document.getElementById('stopStudent').disabled=false;
-  statusEl.textContent='listening student';
+  statusEl.textContent = keepTeacher ? 'listening (teacher + student)' : 'listening (student)';
 }
+
 function stopStudent(){
-  try{mediaRec&&mediaRec.state!=='inactive'&&mediaRec.stop();}catch{}
-  mediaRec=null;
-  if(tabStream){try{tabStream.getTracks().forEach(t=>t.stop());}catch{}tabStream=null;}
+  try{ mediaRec && mediaRec.state!=='inactive' && mediaRec.stop(); }catch{}
+  mediaRec = null;
+  if(tabStream){ try{ tabStream.getTracks().forEach(t=>t.stop()); }catch{} tabStream=null; }
   document.getElementById('tabBtn').disabled=false;
   document.getElementById('stopStudent').disabled=true;
-  statusEl.textContent='idle';
+  statusEl.textContent = keepTeacher ? 'listening (teacher)' : 'idle';
 }
 
-function arrayBufferToBase64(b){let bin='',bytes=new Uint8Array(b);for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin);}
-
-// ========== AI HINTS ==========
+/* ====== AI Hints ====== */
 let busy=false;
 async function requestHints(){
-  if(busy)return;busy=true;
+  if(busy) return; busy=true;
   try{
-    const r=await fetch('/api/hints',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teacher:tFull,student:sFull})});
-    const d=await r.json();if(d.card)prependCard(d.card);
-  }catch(e){console.warn(e);}busy=false;
+    const r = await fetch('/api/hints', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ teacher: tFull, student: sFull })
+    });
+    const d = await r.json();
+    if(d?.card) prependCard(d.card);
+  }catch(e){ console.warn(e); }
+  busy=false;
 }
 
 function prependCard(card){
-  const div=document.createElement('div');div.className='entry';
-  div.innerHTML=`<div class="cols">
-  <div class="col error"><h4>Errors & Fix</h4><div class="errors"></div></div>
-  <div class="col def"><h4>Definitions</h4><div class="defs"></div></div>
-  <div class="col syn"><h4>Synonyms</h4><div class="syns"></div></div></div>`;
-  const eW=div.querySelector('.errors'),dW=div.querySelector('.defs'),sW=div.querySelector('.syns');
+  const div=document.createElement('div'); div.className='entry';
+  div.innerHTML=`
+    <div class="cols">
+      <div class="col error"><h4>Errors & Fix</h4><div class="errors"></div></div>
+      <div class="col def"><h4>Definitions</h4><div class="defs"></div></div>
+      <div class="col syn"><h4>Synonyms</h4><div class="syns"></div></div>
+    </div>`;
+  const eW=div.querySelector('.errors'), dW=div.querySelector('.defs'), sW=div.querySelector('.syns');
+
   (card.errors||[]).forEach(e=>{
-    const el=document.createElement('div');el.className='errItem';
-    el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`;eW.appendChild(el);});
+    const el=document.createElement('div'); el.className='errItem';
+    el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`;
+    eW.appendChild(el);
+  });
   (card.definitions||[]).forEach(x=>{
-    const el=document.createElement('div');el.className='defItem';
-    el.innerHTML=`<b>${x.word}</b> (${x.pos}) — ${x.simple_def}`;dW.appendChild(el);});
+    const el=document.createElement('div'); el.className='defItem';
+    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`;
+    dW.appendChild(el);
+  });
   (card.synonyms||[]).forEach(x=>{
-    const el=document.createElement('div');el.className='synItem';
-    el.innerHTML=`<b>${x.word}</b> (${x.pos}) → ${(x.list||[]).join(', ')}`;sW.appendChild(el);});
-  feed.prepend(div);while(feed.children.length>30)feed.removeChild(feed.lastChild);
+    const el=document.createElement('div'); el.className='synItem';
+    el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`;
+    sW.appendChild(el);
+  });
+
+  feed.prepend(div);
+  while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }
 
-document.getElementById('micBtn').onclick=startTeacher;
-document.getElementById('stopTeacher').onclick=stopTeacher;
-document.getElementById('tabBtn').onclick=startStudent;
-document.getElementById('stopStudent').onclick=stopStudent;
+/* ====== Quick test → в учителя ====== */
+document.getElementById('sendManual').onclick = async () => {
+  const el = document.getElementById('manualText');
+  const t = el.value.trim(); if(!t) return;
+  tFull = tFull ? (tFull + ' ' + t) : t;
+  teacherOut.textContent = tFull;
+  const tt = tail(tFull); if(tt && tt !== tLast){ tLast = tt; requestHints(); }
+  el.value = '';
+};
+
+/* ====== Bind кнопок ====== */
+document.getElementById('micBtn').onclick = startTeacher;
+document.getElementById('stopTeacher').onclick = stopTeacher;
+document.getElementById('tabBtn').onclick = startStudent;
+document.getElementById('stopStudent').onclick = stopStudent;
+
+/* utils */
+function arrayBufferToBase64(buffer){
+  let binary=''; const bytes=new Uint8Array(buffer);
+  for(let i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
 </script>
 </body>
 </html>
