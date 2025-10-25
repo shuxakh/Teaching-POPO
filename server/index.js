@@ -20,7 +20,7 @@ function lastTail(text, maxWords = 15) {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-// === LLM подсказки ===
+// --- AI hints (общие подсказки по хвосту teacher+student) ---
 app.post('/api/hints', async (req, res) => {
   try {
     const teacher = (req.body?.teacher || '').trim();
@@ -75,7 +75,7 @@ Return STRICT JSON:
   }
 });
 
-// === Whisper STT для ученика ===
+// --- Whisper STT для студента (звук вкладки) ---
 app.post('/api/stt_student', async (req, res) => {
   try {
     const { audioBase64 } = req.body || {};
@@ -108,4 +108,7 @@ app.post('/api/stt_student', async (req, res) => {
 
 app.use(express.static('client'));
 app.get('/', (_req, res) => res.redirect('/teacher.html'));
-app.listen(PORT, () => console.log(`Ready → http://localhost:${PORT}/teacher.html`));
+
+app.listen(PORT, () => {
+  console.log(`Ready → http://localhost:${PORT}/teacher.html`);
+});
