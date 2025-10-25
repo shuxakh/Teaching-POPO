@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Teacher — AI Hints (Private)</title>
+  <title>Teaching POPO — AI Hints (Private)</title>
   <style>
     :root{
       --card:#fff;
@@ -21,7 +21,7 @@
       --col-gap:12px;
     }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background:#fafbff;}
-    .wrap { max-width: 1100px; margin: 0 auto; }
+    .wrap { max-width: 1200px; margin: 0 auto; }
     .row { display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
     .card { border:1px solid var(--border); border-radius:14px; padding:14px; background:var(--card); margin-bottom:12px; }
     .live { background:#f6f7fb; padding:12px; border-radius:12px; min-height:70px; border:1px solid var(--border); }
@@ -32,7 +32,11 @@
     .warn { color: #b71c1c; }
 
     .topgrid { display:grid; grid-template-columns: 1fr 320px; gap:12px; align-items:start; }
-    @media (max-width: 900px) { .topgrid { grid-template-columns: 1fr; } }
+    @media (max-width: 1000px) { .topgrid { grid-template-columns: 1fr; } }
+
+    /* transcripts: teacher | student */
+    .twocol { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    @media (max-width: 1000px) { .twocol { grid-template-columns: 1fr; } }
 
     /* FEED: новые карточки сверху */
     .feed { display:flex; flex-direction: column; gap: 12px; }
@@ -57,197 +61,225 @@
 
     @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
 
-    /* компактное поле Quick test */
     .quick input { width: 100%; padding: 10px; border:1px solid #ddd; border-radius:10px;}
     .quick button { padding: 10px 12px; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Teacher Panel — Private AI Hints</h1>
-    <p class="note">Chrome only. Choose audio source → start → AI will show brief, structured hints only here.</p>
+    <h1>Teaching POPO — AI Hints</h1>
+    <p class="note">Choose audio source(s) → start → AI shows structured hints below. Teacher & Student transcripts are separate.</p>
 
     <div class="topgrid">
-      <!-- левая карточка: выбор источника -->
+      <!-- левая карточка: источники -->
       <div class="card">
         <div class="row">
-          <label>Audio source:</label>
-          <button id="micBtn">🎙️ Microphone</button>
-          <button id="tabBtn">🖥️ Capture a Chrome Tab (with audio)</button>
-          <button id="stopBtn" disabled>⏹️ Stop</button>
+          <label>Teacher input:</label>
+          <button id="micBtn">🎙️ Teacher Mic</button>
+          <button id="stopTeacher" disabled>⏹️ Stop</button>
         </div>
-        <p class="note">
-          <b>Capture Tab:</b> выбери вкладку и отметь “Share tab audio”. Мы проигрываем звук вкладки через динамики,
-          а распознаёт микрофон (ограничение Web Speech API). Для идеала позже подключим серверный Whisper.
+        <div class="row" style="margin-top:8px">
+          <label>Student input:</label>
+          <button id="tabBtn">🖥️ Student Tab (with audio)</button>
+          <button id="stopStudent" disabled>⏹️ Stop</button>
+        </div>
+        <p class="note" style="margin-top:6px">
+          <b>Student Tab:</b> выбери вкладку и отметь “Share tab audio”. Звук вкладки уходит кусочками на сервер (Whisper) —
+          это отдельный поток от учительского микрофона.
         </p>
       </div>
 
-      <!-- правая маленькая карточка: Quick test -->
+      <!-- правая компактная карточка: Quick test -->
       <div class="card quick">
         <h3 style="margin-top:0">Quick test</h3>
         <div class="row" style="gap:8px">
           <input id="manualText" placeholder="Type a word or phrase…">
           <button id="sendManual">Send</button>
         </div>
-        <p class="note" style="margin:8px 0 0">Напиши слово/фразу, если его ещё не произнесли.</p>
+        <p class="note" style="margin:8px 0 0">Добавляет текст в транскрипт учителя.</p>
       </div>
     </div>
 
-    <h3>Live transcript</h3>
-    <div id="transcript" class="live">—</div>
+    <div class="twocol">
+      <div>
+        <h3>Teacher transcript</h3>
+        <div id="teacherOut" class="live">—</div>
+      </div>
+      <div>
+        <h3>Student transcript</h3>
+        <div id="studentOut" class="live">—</div>
+      </div>
+    </div>
 
-    <h3>AI hints for teacher (newest on top)</h3>
+    <h3 style="margin-top:16px">AI hints for teacher (newest on top)</h3>
     <div id="feed" class="feed"></div>
 
-    <p class="note">Status: <span id="status">stopped</span></p>
+    <p class="note">Status: <span id="status">idle</span></p>
   </div>
 
   <script>
+    // DOM
     const statusEl = document.getElementById('status');
-    const out = document.getElementById('transcript');
+    const teacherOut = document.getElementById('teacherOut');
+    const studentOut = document.getElementById('studentOut');
     const feed = document.getElementById('feed');
+
     const micBtn = document.getElementById('micBtn');
+    const stopTeacherBtn = document.getElementById('stopTeacher');
     const tabBtn = document.getElementById('tabBtn');
-    const stopBtn = document.getElementById('stopBtn');
+    const stopStudentBtn = document.getElementById('stopStudent');
 
-    let recog = null;
-    let keepListening = false;
-    let fullText = "";
-    let lastSentTail = "";
+    // State
+    let SR = null;           // SpeechRecognition instance (teacher)
+    let keepTeacher = false;
+    let tFull = "", sFull = "";
+    let tLastTail = "", sLastTail = "";
     let pingTimer = null;
-    let tabAudioEl = null;
-    let inactivityTimer = null;       // <-- ТАЙМ-АУТ ПАУЗЫ
 
+    // student capture
+    let tabStream = null;
+    let mediaRec = null;
+    const CHUNK_MS = 1500; // отправляем кусочки раз в 1.5s
+
+    // helpers
     function supportsSR() {
       return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
     }
-    function tail(text, maxWords=20){
+    function tail(text, maxWords=15){
       const words = (text||"").trim().split(/\s+/);
       return words.slice(-maxWords).join(" ").toLowerCase();
     }
-
-    function startUI(mode){
-      micBtn.disabled = true;
-      tabBtn.disabled = true;
-      stopBtn.disabled = false;
-      statusEl.textContent = `listening (${mode})`;
-      statusEl.className = "ok";
-      if (!pingTimer) pingTimer = setInterval(() => { fetch('/api/health').catch(()=>{}); }, 20000);
+    function startPing(){
+      if (!pingTimer) pingTimer = setInterval(()=>{ fetch('/api/health').catch(()=>{}); }, 20000);
     }
-    function stopUI(){
-      stopBtn.disabled = true;
-      micBtn.disabled = false;
-      tabBtn.disabled = false;
-      statusEl.textContent = "stopped";
-      statusEl.className = "";
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      clearTimeout(inactivityTimer);
-    }
+    function stopPing(){ if (pingTimer){ clearInterval(pingTimer); pingTimer=null; } }
 
-    function scheduleClearAfterPause(ms=4000){
-      clearTimeout(inactivityTimer);
-      inactivityTimer = setTimeout(() => {
-        // новая «сцена»: очищаем live и контекст
-        fullText = "";
-        lastSentTail = "";
-        out.textContent = "—";
-      }, ms);
-    }
+    // ---------- Teacher (browser SR) ----------
+    function initSR(lang='en-US'){
+      const S = window.SpeechRecognition || window.webkitSpeechRecognition;
+      SR = new S();
+      SR.lang = lang;
+      SR.interimResults = true;
+      SR.continuous = true;
 
-    function initRecog(lang='en-US') {
-      if (!supportsSR()) { alert("Update Chrome for SpeechRecognition API."); return; }
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      recog = new SR();
-      recog.lang = lang;
-      recog.interimResults = true;
-      recog.continuous = true;
-
-      recog.onresult = async (e) => {
+      SR.onresult = async (e) => {
         let interim = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const r = e.results[i];
           if (r.isFinal) {
             const piece = r[0].transcript.trim();
             if (!piece) continue;
+            tFull += (tFull ? ' ' : '') + piece;
+            teacherOut.textContent = tFull;
 
-            fullText += (fullText ? ' ' : '') + piece;
-            out.textContent = fullText;
-
-            const t = tail(fullText, 20);
-            if (t && t !== lastSentTail) {
-              lastSentTail = t;
-              try {
-                const resp = await fetch('/api/hints', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ text: fullText })
-                });
-                const data = await resp.json();
-                if (data && data.card) prependCard(data.card);
-              } catch (e) { console.warn('Hints error', e); }
+            const t = tail(tFull);
+            if (t && t !== tLastTail) {
+              tLastTail = t;
+              requestHints(); // отправляем общие подсказки с обоих каналов
             }
-            scheduleClearAfterPause(); // перезапускаем таймер очистки при каждом финальном фрагменте
           } else {
             interim += r[0].transcript;
           }
         }
-        if (interim) out.textContent = (fullText + ' ' + interim).trim();
+        if (interim) teacherOut.textContent = (tFull + ' ' + interim).trim();
       };
 
-      recog.onerror = (e) => {
-        console.warn('SpeechRecognition error', e);
-        statusEl.textContent = "error (speech)";
-        statusEl.className = "warn";
+      SR.onerror = (e) => {
+        console.warn('Teacher SR error', e);
       };
 
-      recog.onend = () => {
-        if (keepListening) {
-          try { recog.start(); } catch {}
-        } else {
-          stopUI();
-        }
+      SR.onend = () => {
+        if (keepTeacher) { try { SR.start(); } catch{} }
       };
     }
 
-    async function startMic(){
-      if (!recog) initRecog('en-US');
-      fullText = ""; lastSentTail = "";
-      out.textContent = "Listening via Microphone…";
-      keepListening = true;
-      startUI('mic');
+    async function startTeacher(){
+      if (!supportsSR()) { alert('Update Chrome for SpeechRecognition API.'); return; }
+      if (!SR) initSR('en-US');
+      tFull = ""; tLastTail = "";
+      teacherOut.textContent = "Listening (Teacher Mic)…";
+      keepTeacher = true;
+      statusEl.textContent = "listening (teacher)";
       try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch {}
-      scheduleClearAfterPause();
-      try { recog.start(); } catch {}
+      startPing();
+      try { SR.start(); } catch {}
+      micBtn.disabled = true; stopTeacherBtn.disabled = false;
+    }
+    function stopTeacher(){
+      keepTeacher = false;
+      try { SR && SR.stop(); } catch{}
+      micBtn.disabled = false; stopTeacherBtn.disabled = true;
+      if (!mediaRec) stopPing();
+      statusEl.textContent = mediaRec ? "listening (student)" : "idle";
     }
 
-    async function startTabCapture(){
-      if (!recog) initRecog('en-US');
-      fullText = ""; lastSentTail = "";
-      out.textContent = "Listening to captured tab… (turn speakers on)";
-      keepListening = true;
-      startUI('tab');
-
+    // ---------- Student (tab capture + Whisper) ----------
+    async function startStudent(){
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-        if (tabAudioEl) { try { tabAudioEl.pause(); } catch{} }
-        tabAudioEl = new Audio();
-        tabAudioEl.srcObject = stream;
-        tabAudioEl.muted = false;
-        tabAudioEl.play().catch(()=>{});
+        tabStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       } catch (e) {
-        alert('Tab capture was cancelled. You can use Microphone instead.');
-        stopAll();
+        alert('Tab capture cancelled.');
         return;
       }
-      scheduleClearAfterPause();
-      try { recog.start(); } catch {}
+      sFull = ""; sLastTail = "";
+      studentOut.textContent = "Capturing Student Tab…";
+      startPing();
+
+      // MediaRecorder → каждые CHUNK_MS отправляем кусок на сервер
+      mediaRec = new MediaRecorder(tabStream, { mimeType: 'audio/webm' });
+      mediaRec.ondataavailable = async (ev) => {
+        if (!ev.data || ev.data.size < 1000) return;
+        const buf = await ev.data.arrayBuffer();
+        const b64 = arrayBufferToBase64(buf);
+        try {
+          const resp = await fetch('/api/stt_student', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ audioBase64: b64, mime: 'audio/webm' })
+          });
+          const data = await resp.json();
+          const text = (data?.text || '').trim();
+          if (text) {
+            sFull += (sFull ? ' ' : '') + text;
+            studentOut.textContent = sFull;
+            const t = tail(sFull);
+            if (t && t !== sLastTail) {
+              sLastTail = t;
+              requestHints();
+            }
+          }
+        } catch (e) {
+          console.warn('Student STT error', e);
+        }
+      };
+      mediaRec.start(CHUNK_MS);
+      tabBtn.disabled = true; stopStudentBtn.disabled = false;
+      statusEl.textContent = keepTeacher ? "listening (teacher + student)" : "listening (student)";
     }
 
-    function stopAll(){
-      keepListening = false;
-      try { recog && recog.stop(); } catch {}
-      if (tabAudioEl) { try { tabAudioEl.pause(); } catch{} tabAudioEl = null; }
-      stopUI();
+    function stopStudent(){
+      if (mediaRec) { try { mediaRec.stop(); } catch{} mediaRec = null; }
+      if (tabStream) { tabStream.getTracks().forEach(t=>t.stop()); tabStream=null; }
+      tabBtn.disabled = false; stopStudentBtn.disabled = true;
+      if (!keepTeacher) stopPing();
+      statusEl.textContent = keepTeacher ? "listening (teacher)" : "idle";
+    }
+
+    // ---------- Shared Hints ----------
+    let hintsBusy = false;
+    async function requestHints(){
+      if (hintsBusy) return; // простая защита от наплыва
+      hintsBusy = true;
+      try{
+        const resp = await fetch('/api/hints', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ teacher: tFull, student: sFull })
+        });
+        const data = await resp.json();
+        if (data && data.card) prependCard(data.card);
+      } catch(e){ console.warn('Hints error', e); }
+      hintsBusy = false;
     }
 
     function prependCard(card){
@@ -303,36 +335,39 @@
       });
 
       feed.prepend(entry);
-      const max = 20;
+      const max = 30;
       while (feed.children.length > max) feed.removeChild(feed.lastChild);
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
-      micBtn.disabled = false;
-      tabBtn.disabled = false;
-      micBtn.onclick = startMic;
-      tabBtn.onclick = startTabCapture;
-      stopBtn.onclick = stopAll;
+    // quick test → добавляет в учителя
+    document.getElementById('sendManual').onclick = async () => {
+      const el = document.getElementById('manualText');
+      const t = el.value.trim();
+      if (!t) return;
+      tFull = tFull ? (tFull + ' ' + t) : t;
+      teacherOut.textContent = tFull;
+      const tt = tail(tFull);
+      if (tt && tt !== tLastTail) {
+        tLastTail = tt;
+        requestHints();
+      }
+      el.value = '';
+    };
 
-      // Quick test
-      document.getElementById('sendManual').onclick = async () => {
-        const t = document.getElementById('manualText').value.trim();
-        if (!t) return;
-        fullText = fullText ? (fullText + ' ' + t) : t;
-        out.textContent = fullText;
-        lastSentTail = tail(fullText, 20);
-        try {
-          const resp = await fetch('/api/hints', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ text: fullText })
-          });
-          const data = await resp.json();
-          if (data && data.card) prependCard(data.card);
-        } catch(e){ console.warn(e); }
-        scheduleClearAfterPause();
-      };
-    });
+    // bind
+    micBtn.onclick = startTeacher;
+    stopTeacherBtn.onclick = stopTeacher;
+    tabBtn.onclick = startStudent;
+    stopStudentBtn.onclick = stopStudent;
+
+    // utils
+    function arrayBufferToBase64(buffer) {
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      const len = bytes.byteLength;
+      for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
   </script>
 </body>
 </html>
