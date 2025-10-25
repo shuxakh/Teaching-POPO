@@ -13,11 +13,11 @@ const app = express();
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
-
 app.use(express.static(path.join(__dirname, "..", "client")));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// STT для студента (WAV/PCM, язык фиксируем EN)
 app.post("/api/stt_student", async (req, res) => {
   try {
     const { audioBase64, mime } = req.body || {};
@@ -34,14 +34,14 @@ app.post("/api/stt_student", async (req, res) => {
       const r = await openai.audio.transcriptions.create({
         file,
         model: "gpt-4o-mini-transcribe",
-        language: "en",         // ⬅️ фиксируем язык
+        language: "en",
       });
       text = (r?.text || "").trim();
     } catch {
       const r2 = await openai.audio.transcriptions.create({
         file,
         model: "whisper-1",
-        language: "en",         // ⬅️ и здесь тоже
+        language: "en",
       });
       text = (r2?.text || "").trim();
     }
@@ -53,6 +53,7 @@ app.post("/api/stt_student", async (req, res) => {
   }
 });
 
+// Генерация подсказок (3 колонки)
 app.post("/api/hints", async (req, res) => {
   try {
     const { teacher = "", student = "" } = req.body || {};
@@ -90,6 +91,7 @@ Input: """${input}"""`;
   }
 });
 
+// single-page
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
