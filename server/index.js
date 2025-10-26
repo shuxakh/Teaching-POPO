@@ -73,7 +73,7 @@ Keep it short. Use simple English. Pick a few relevant nouns/verbs/adjectives.
 Input: """${input}"""`;
 
     const chat = await openai.chat.completions.create({
-      model: "gpt-4o-mini", // быстрые подсказки
+      model: "gpt-4o-nano", // быстрые подсказки
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
       response_format: { type: "json_object" },
