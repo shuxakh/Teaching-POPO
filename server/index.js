@@ -1,10 +1,12 @@
 // server/index.js
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 
 import OpenAI from "openai";
 import { toFile } from "openai/uploads";
+import os from "os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,21 +32,21 @@ app.post("/api/stt_student", async (req, res) => {
     });
 
     let text = "";
-    try {
-      const r = await openai.audio.transcriptions.create({
-        file,
-        model: "gpt-4o-mini-transcribe", // быстрый STT
-        language: "en",
-      });
-      text = (r?.text || "").trim();
-    } catch {
+    // try {
+    //   const r = await openai.audio.transcriptions.create({
+    //     file,
+    //     model: "gpt-4o-mini-transcribe", // быстрый STT
+    //     language: "en",
+    //   });
+    //   text = (r?.text || "").trim();
+    // } catch {
       const r2 = await openai.audio.transcriptions.create({
         file,
         model: "whisper-1",
         language: "en",
       });
       text = (r2?.text || "").trim();
-    }
+    // }
 
     return res.json({ text });
   } catch (err) {
@@ -96,7 +98,27 @@ app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "client", "teacher.html"));
 });
 
+const HOST = process.env.HOST || "0.0.0.0";
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Teacher-only AI Tutor running: http://localhost:${PORT}/teacher.html`);
+
+function getLanIPv4() {
+  const nets = os.networkInterfaces();
+  const results = [];
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === "IPv4" && !net.internal) results.push(net.address);
+    }
+  }
+  return results;
+}
+
+app.listen(PORT, HOST, () => {
+  const localUrl = `http://localhost:${PORT}/teacher.html`;
+  const lanIps = getLanIPv4();
+  const lanUrls = lanIps.map(ip => `http://${ip}:${PORT}/teacher.html`);
+  console.log(`Teacher-only AI Tutor running:`);
+  console.log(`- Local: ${localUrl}`);
+  if (lanUrls.length) {
+    console.log(`- LAN:   ${lanUrls.join(", ")}`);
+  }
 });

@@ -15,17 +15,19 @@ You need
 Steps
 -----
 1) Unzip this folder.
-2) Rename file "env.example" to ".env"
-   - Open ".env" with any text editor.
-   - Replace sk-REPLACE_ME with your real OpenAI key.
-3) Open Terminal (Mac) or Command Prompt (Windows) in this folder and run:
-   npm install
-   npm start
-4) In Chrome, open:  http://localhost:8080/teacher.html
+2) Easiest (no Terminal):
+   - On macOS: double-click "Start.command" in this folder. If there's no .env, it will use your machine's OPENAI_API_KEY if set; otherwise it will ask for your key once and open the page automatically.
+   - On Windows: open Command Prompt in this folder and run: run.sh (WSL/Git Bash) or follow step 3.
+3) Manual (Terminal):
+   - Copy "env.example" to ".env" and put your OpenAI key.
+   - Run: npm install
+   - Start: npm run start:host
+   - Open: http://localhost:10000/teacher.html
 5) Click:
    - "Microphone" if your laptop mic can hear the student (speaker on)
    - OR "Capture a Chrome Tab" if the student speaks in a Chrome tab (Meet/Zoom Web). When Chrome asks, choose the tab and tick "Share tab audio".
 6) Watch live transcript and AI hints appear. These hints are private (only on this page).
+7) To connect from another device on the same Wi‑Fi, use one of the LAN URLs shown by Start.command/run.sh (e.g., http://YOUR_LAN_IP:10000/teacher.html).
 
 Tips
 ----
