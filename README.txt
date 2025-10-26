@@ -16,7 +16,7 @@ Steps
 -----
 1) Unzip this folder.
 2) Easiest (no Terminal):
-   - On macOS: double-click "Start.command" in this folder. If there's no .env, it will use your machine's OPENAI_API_KEY if set; otherwise it will ask for your key once and open the page automatically.
+   - On macOS: double-click "Start.command" in this folder. If there's no .env, it will use your machine's OPENAI_API_KEY if set; otherwise it will ask for your key once. It will open the page using your LAN IP so other devices can connect.
    - On Windows: open Command Prompt in this folder and run: run.sh (WSL/Git Bash) or follow step 3.
 3) Manual (Terminal):
    - Copy "env.example" to ".env" and put your OpenAI key.

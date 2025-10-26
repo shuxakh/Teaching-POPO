@@ -64,7 +64,12 @@ fi
 if [ "${NO_AUTO_OPEN}" != "1" ]; then
   # Prefer Google Chrome if available; fallback to default browser
   if command -v open >/dev/null 2>&1; then
-    (sleep 1; open "$LOCAL_URL") >/dev/null 2>&1 &
+    FIRST_IP=$(echo "$FOUND_IPS" | head -n1)
+    if [ -n "$FIRST_IP" ]; then
+      (sleep 1; open "http://${FIRST_IP}:${PORT}/teacher.html") >/dev/null 2>&1 &
+    else
+      echo "No LAN IP auto-detected. Not auto-opening localhost." >&2
+    fi
   fi
 fi
 
