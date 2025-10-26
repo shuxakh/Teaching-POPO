@@ -28,6 +28,7 @@
     .errItem{background:#fff0e5;border:1px solid #ffc58a}
     .defItem{background:#f5f0ff;border:1px solid #c9b6ff}
     .synItem{background:#f0fff0;border:1px solid #b8e6b8}
+    .ex{color:#444;font-style:italic;margin-top:4px}
     .note{color:#666;font-size:.9rem}
     .diag{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b1020;color:#d9e1ff;border-radius:12px;border:1px solid #263056;padding:12px;line-height:1.35;overflow:auto;position:relative}
     .ghost{position:absolute;right:8px;top:8px;opacity:.3}
@@ -372,7 +373,7 @@ function prependCard(card){
   </div>`;
   const eW=div.querySelector('.errors'), dW=div.querySelector('.defs'), sW=div.querySelector('.syns');
   (card.errors||[]).forEach(e=>{ const el=document.createElement('div'); el.className='errItem'; el.innerHTML=`<b>${e.title||'Mistake'}</b><br>❌ ${e.wrong||''}<br>✅ ${e.fix||''}<div>${e.explanation||''}</div>`; eW.appendChild(el); });
-  (card.definitions||[]).forEach(x=>{ const el=document.createElement('div'); el.className='defItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}`; dW.appendChild(el); });
+  (card.definitions||[]).forEach(x=>{ const el=document.createElement('div'); el.className='defItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) — ${x.simple_def||''}${x.example?`<div class="ex">e.g., ${x.example}</div>`:''}`; dW.appendChild(el); });
   (card.synonyms||[]).forEach(x=>{ const el=document.createElement('div'); el.className='synItem'; el.innerHTML=`<b>${x.word||''}</b> (${x.pos||''}) → ${(x.list||[]).join(', ')}`; sW.appendChild(el); });
   feed.prepend(div); while(feed.children.length>30) feed.removeChild(feed.lastChild);
 }

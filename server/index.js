@@ -66,16 +66,20 @@ app.post("/api/hints", async (req, res) => {
 You are a concise English-teaching assistant. From the input text, produce a JSON with:
 {
   "errors": [{"title": "...", "wrong": "...", "fix": "...", "explanation": "..."}],
-  "definitions": [{"word": "...", "pos": "noun|verb|adj", "simple_def": "..."}],
+  "definitions": [{"word": "...", "pos": "noun|verb|adj", "simple_def": "...", "example": "Use the word in a simple sentence."}],
   "synonyms": [{"word": "...", "pos": "noun|verb|adj", "list": ["...","..."]}]
 }
-Keep it short. Use simple English. Pick a few relevant nouns/verbs/adjectives.
+Rules for definitions:
+- Keep the example very short and in simple English.
+- Ensure the example is a natural sentence using the word correctly.
+- Do not include quotes around the example.
+Keep it short overall. Choose a few relevant nouns/verbs/adjectives.
 Input: """${input}"""`;
 
     const chat = await openai.chat.completions.create({
-      model: "gpt-4o-nano", // быстрые подсказки
+      model: "gpt-4.1-nano", // быстрые подсказки
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
+      temperature: 0.7,
       response_format: { type: "json_object" },
     });
 
